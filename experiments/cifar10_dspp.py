@@ -130,6 +130,8 @@ def main(cfg: dict, config_path: str) -> None:
         device=device,
         cnn=cnn,
         run=run,
+        eval_loader=test_loader,
+        eval_every=train_cfg.get("eval_every", 5),
     )
 
     # ── Evaluation ────────────────────────────────────────────────────────────
