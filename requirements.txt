@@ -1,0 +1,12 @@
+# Minimal requirements for notebooks/sngp_torch(1).ipynb on Python 3.12
+#
+# The notebook uses CUDA if PyTorch can see it, but it also runs on CPU.
+# If you need a specific CUDA build of torch, install that from PyTorch's
+# official index instead of relying on the default wheel.
+
+# torch>=2.2
+numpy>=1.26
+matplotlib>=3.8
+scikit-learn>=1.4
+ipykernel>=6.29
+jupyterlab>=4.2
