@@ -58,7 +58,10 @@ def train_supcon(
     device: torch.device,
     epoch: int,
     show_progress: bool = True,
-) -> float:
+    run=None,
+    log_every_steps: int | None = None,
+    global_step: int = 0,
+) -> tuple[float, int]:
     model.train()
     running_loss = 0.0
 
@@ -79,13 +82,22 @@ def train_supcon(
         loss.backward()
         optimizer.step()
 
+        global_step += 1
         running_loss += loss.item()
         progress.set_postfix(loss=loss.item())
+        if run is not None and log_every_steps is not None and log_every_steps > 0:
+            if global_step % log_every_steps == 0:
+                run.log({
+                    "train/step_loss": loss.item(),
+                    "train/global_step": global_step,
+                    "train/epoch": epoch,
+                    "train/lr_step": optimizer.param_groups[0]["lr"],
+                })
 
     if scheduler is not None:
         scheduler.step()
 
-    return running_loss / len(train_loader)
+    return running_loss / len(train_loader), global_step
 
 
 @torch.no_grad()

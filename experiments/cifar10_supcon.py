@@ -105,14 +105,17 @@ def main(cfg: dict) -> None:
 
     best_acc = -1.0
     num_epochs = 1 if smoke_test else train_cfg["epochs"]
+    eval_interval = 1 if smoke_test else train_cfg.get("eval_interval", 1)
+    log_every_steps = train_cfg.get("log_every_steps", None)
     output_cfg = cfg.get("output", {})
     checkpoint_path = output_cfg.get("checkpoint_path")
     top_k = output_cfg.get("top_k", 1)
     saved_checkpoints: list[dict] = []
+    global_step = 0
 
     epoch_progress = tqdm(range(1, num_epochs + 1), desc="Epoch", leave=True)
     for epoch in epoch_progress:
-        train_loss = train_supcon(
+        train_loss, global_step = train_supcon(
             model=model,
             train_loader=train_loader,
             optimizer=optimizer,
@@ -121,30 +124,45 @@ def main(cfg: dict) -> None:
             device=device,
             epoch=epoch,
             show_progress=True,
+            run=run,
+            log_every_steps=log_every_steps,
+            global_step=global_step,
         )
-        metrics = evaluate_knn(
-            model=model,
-            memory_loader=memory_loader,
-            val_loader=val_loader,
-            device=device,
-            k=train_cfg["knn_k"],
-            temperature=train_cfg["knn_temperature"],
-        )
-        knn_acc = metrics["knn_accuracy"]
-        print(
-            f"Epoch {epoch:3d}/{num_epochs} | "
-            f"SupCon Loss: {train_loss:.4f} | "
-            f"k-NN Accuracy: {knn_acc * 100:.2f}%"
-        )
-        epoch_progress.set_postfix(loss=f"{train_loss:.4f}", knn=f"{knn_acc * 100:.2f}%")
+
+        should_evaluate = epoch % eval_interval == 0 or epoch == num_epochs
+        knn_acc = None
+        if should_evaluate:
+            metrics = evaluate_knn(
+                model=model,
+                memory_loader=memory_loader,
+                val_loader=val_loader,
+                device=device,
+                k=train_cfg["knn_k"],
+                temperature=train_cfg["knn_temperature"],
+            )
+            knn_acc = metrics["knn_accuracy"]
+            print(
+                f"Epoch {epoch:3d}/{num_epochs} | "
+                f"SupCon Loss: {train_loss:.4f} | "
+                f"k-NN Accuracy: {knn_acc * 100:.2f}%"
+            )
+            epoch_progress.set_postfix(loss=f"{train_loss:.4f}", knn=f"{knn_acc * 100:.2f}%")
+        else:
+            print(f"Epoch {epoch:3d}/{num_epochs} | SupCon Loss: {train_loss:.4f}")
+            epoch_progress.set_postfix(loss=f"{train_loss:.4f}")
 
         if run is not None:
-            run.log({
+            log_data = {
                 "train/loss": train_loss,
-                "eval/knn_accuracy": knn_acc,
                 "train/lr": optimizer.param_groups[0]["lr"],
                 "train/epoch": epoch,
-            })
+            }
+            if knn_acc is not None:
+                log_data["eval/knn_accuracy"] = knn_acc
+            run.log(log_data)
+
+        if knn_acc is None:
+            continue
 
         if knn_acc > best_acc:
             best_acc = knn_acc
@@ -171,9 +189,13 @@ def main(cfg: dict) -> None:
         for checkpoint in saved_checkpoints:
             print(f"  epoch {checkpoint['epoch']:3d} | k-NN {checkpoint['metric'] * 100:.2f}% | {checkpoint['path']}")
 
-    print(f"Best k-NN accuracy: {best_acc * 100:.2f}%")
+    if best_acc >= 0.0:
+        print(f"Best k-NN accuracy: {best_acc * 100:.2f}%")
+    else:
+        print("Best k-NN accuracy: not evaluated")
     if run is not None:
-        run.log({"best/knn_accuracy": best_acc})
+        if best_acc >= 0.0:
+            run.log({"best/knn_accuracy": best_acc})
         run.finish()
 
 
