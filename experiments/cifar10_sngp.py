@@ -186,6 +186,7 @@ def main(cfg: dict) -> None:
         optimizer,
         T_max=1 if smoke_test else train_cfg["epochs"],
     )
+    loss_fn = torch.nn.CrossEntropyLoss()
     best_acc = -1.0
     num_epochs = 1 if smoke_test else train_cfg["epochs"]
     eval_interval = 1 if smoke_test else train_cfg.get("eval_interval", 1)

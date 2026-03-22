@@ -32,6 +32,6 @@ output:
 
 wandb:
   enabled: true
-  project: sngp
+  project: sngp_original
   entity: sta414manygp
   run_name: null
