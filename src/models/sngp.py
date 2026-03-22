@@ -222,12 +222,20 @@ class RandomFeatureGaussianProcess(nn.Module):
         return logits, variances
 
 
-def mean_field_logits(
+def laplace_predictive_probs(
     logits: torch.Tensor,
     variances: torch.Tensor,
-    mean_field_factor: float = math.pi / 8.0,
+    num_mc_samples: int = 10,
 ) -> torch.Tensor:
-    return logits / torch.sqrt(1.0 + mean_field_factor * variances)
+    std = torch.sqrt(torch.clamp(variances, min=1e-12))
+    noise = torch.randn(
+        num_mc_samples,
+        *logits.shape,
+        device=logits.device,
+        dtype=logits.dtype,
+    )
+    sampled_logits = logits.unsqueeze(0) + noise * std.unsqueeze(0)
+    return sampled_logits.softmax(dim=-1).mean(dim=0)
 
 
 class SNGPResNetClassifier(nn.Module):

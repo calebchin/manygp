@@ -20,7 +20,7 @@ training:
   weight_decay: 0.0001
 
 output:
-  checkpoint_path: ./checkpoints/cifar10_classifier.pt
+  checkpoint_path: ./checkpoints_clf/cifar10_classifier.pt
   top_k: 10
 
 wandb:

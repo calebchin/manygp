@@ -24,7 +24,7 @@ training:
   knn_temperature: 0.1
 
 output:
-  checkpoint_path: ./checkpoints/cifar10_supcon_best.pt
+  checkpoint_path: ./checkpoints_supcon/cifar10_supcon_best.pt
   top_k: 10
 
 wandb:

@@ -18,7 +18,7 @@ from tqdm.auto import tqdm
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from src.data.cifar10 import get_cifar10_loaders
-from src.models.sngp import SNGPResNetClassifier, mean_field_logits
+from src.models.sngp import SNGPResNetClassifier, laplace_predictive_probs
 
 
 def update_topk_checkpoints(
@@ -108,9 +108,8 @@ def train_epoch(
 def evaluate_sngp(
     model: torch.nn.Module,
     loader,
-    loss_fn: torch.nn.Module,
     device: torch.device,
-    mean_field_factor: float = math.pi / 8.0,
+    num_mc_samples: int = 10,
 ) -> dict[str, float]:
     model.eval()
     running_loss = 0.0
@@ -122,12 +121,12 @@ def evaluate_sngp(
         images = images.to(device, non_blocking=True)
         labels = labels.to(device, non_blocking=True)
         logits, variances = model(images, return_cov=True)
-        adjusted_logits = mean_field_logits(logits, variances, mean_field_factor=mean_field_factor)
-        loss = loss_fn(adjusted_logits, labels)
-        log_probs = adjusted_logits.log_softmax(dim=-1)
+        probs = laplace_predictive_probs(logits, variances, num_mc_samples=num_mc_samples)
+        log_probs = probs.clamp_min(1e-12).log()
+        loss = -log_probs.gather(1, labels.unsqueeze(1)).mean()
 
         running_loss += loss.item()
-        total_correct += (adjusted_logits.argmax(dim=1) == labels).sum().item()
+        total_correct += (probs.argmax(dim=1) == labels).sum().item()
         total_examples += labels.size(0)
         total_nll += -log_probs.gather(1, labels.unsqueeze(1)).sum().item()
 
@@ -187,13 +186,11 @@ def main(cfg: dict) -> None:
         optimizer,
         T_max=1 if smoke_test else train_cfg["epochs"],
     )
-    loss_fn = torch.nn.CrossEntropyLoss()
-
     best_acc = -1.0
     num_epochs = 1 if smoke_test else train_cfg["epochs"]
     eval_interval = 1 if smoke_test else train_cfg.get("eval_interval", 1)
     log_every_steps = train_cfg.get("log_every_steps", None)
-    mean_field_factor = train_cfg.get("mean_field_factor", math.pi / 8.0)
+    num_mc_samples = train_cfg.get("num_mc_samples", 10)
     output_cfg = cfg.get("output", {})
     checkpoint_path = output_cfg.get("checkpoint_path")
     top_k = output_cfg.get("top_k", 1)
@@ -224,9 +221,8 @@ def main(cfg: dict) -> None:
             metrics = evaluate_sngp(
                 model=model,
                 loader=val_loader,
-                loss_fn=loss_fn,
                 device=device,
-                mean_field_factor=mean_field_factor,
+                num_mc_samples=num_mc_samples,
             )
             val_loss = metrics["loss"]
             val_acc = metrics["accuracy"]

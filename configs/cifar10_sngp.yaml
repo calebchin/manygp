@@ -24,10 +24,10 @@ training:
   log_every_steps: 20
   lr: 0.001
   weight_decay: 0.0
-  mean_field_factor: 0.3926990817
+  num_mc_samples: 10
 
 output:
-  checkpoint_path: ./checkpoints/cifar10_sngp.pt
+  checkpoint_path: ./checkpoints_sngp/cifar10_sngp.pt
   top_k: 10
 
 wandb:
