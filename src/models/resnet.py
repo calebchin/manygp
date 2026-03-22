@@ -108,3 +108,23 @@ class SupConResNet(nn.Module):
         embeddings = self.encoder(x)
         projections = self.projector(embeddings)
         return F.normalize(projections, dim=1)
+
+
+class CifarResNetClassifier(nn.Module):
+    """CIFAR ResNet encoder with a linear classification head."""
+
+    def __init__(
+        self,
+        embedding_dim: int = 128,
+        num_classes: int = 10,
+        width: int = 64,
+    ):
+        super().__init__()
+        self.encoder = CifarResNetEncoder(width=width, embedding_dim=embedding_dim)
+        self.classifier = nn.Linear(embedding_dim, num_classes)
+
+    def encode(self, x: torch.Tensor) -> torch.Tensor:
+        return self.encoder(x)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.classifier(self.encode(x))
