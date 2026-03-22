@@ -8,6 +8,7 @@ Usage:
 import argparse
 import os
 import sys
+from pathlib import Path
 
 import torch
 import yaml
@@ -18,6 +19,42 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from src.data.cifar10 import get_cifar10_supcon_loaders
 from src.models.resnet import SupConResNet
 from src.training.contrastive import SupConLoss, evaluate_knn, train_supcon
+
+
+def update_topk_checkpoints(
+    saved_checkpoints: list[dict],
+    top_k: int,
+    checkpoint_path: str,
+    state: dict,
+    metric_name: str,
+    metric_value: float,
+    epoch: int,
+) -> None:
+    if top_k <= 0:
+        return
+
+    checkpoint_target = Path(checkpoint_path)
+    checkpoint_target.parent.mkdir(parents=True, exist_ok=True)
+    checkpoint_stem = checkpoint_target.stem
+    checkpoint_suffix = checkpoint_target.suffix or ".pt"
+    candidate_path = checkpoint_target.parent / (
+        f"{checkpoint_stem}_epoch{epoch:03d}_{metric_name}{metric_value:.4f}{checkpoint_suffix}"
+    )
+
+    if len(saved_checkpoints) < top_k:
+        torch.save(state, candidate_path)
+        saved_checkpoints.append({"metric": metric_value, "path": candidate_path, "epoch": epoch})
+    else:
+        worst_checkpoint = min(saved_checkpoints, key=lambda item: (item["metric"], -item["epoch"]))
+        if metric_value <= worst_checkpoint["metric"]:
+            return
+
+        torch.save(state, candidate_path)
+        saved_checkpoints.append({"metric": metric_value, "path": candidate_path, "epoch": epoch})
+        worst_checkpoint["path"].unlink(missing_ok=True)
+        saved_checkpoints.remove(worst_checkpoint)
+
+    saved_checkpoints.sort(key=lambda item: item["metric"], reverse=True)
 
 
 def main(cfg: dict) -> None:
@@ -67,8 +104,11 @@ def main(cfg: dict) -> None:
     loss_fn = SupConLoss(temperature=train_cfg["supcon_temperature"])
 
     best_acc = -1.0
-    best_state = None
     num_epochs = 1 if smoke_test else train_cfg["epochs"]
+    output_cfg = cfg.get("output", {})
+    checkpoint_path = output_cfg.get("checkpoint_path")
+    top_k = output_cfg.get("top_k", 1)
+    saved_checkpoints: list[dict] = []
 
     epoch_progress = tqdm(range(1, num_epochs + 1), desc="Epoch", leave=True)
     for epoch in epoch_progress:
@@ -108,20 +148,28 @@ def main(cfg: dict) -> None:
 
         if knn_acc > best_acc:
             best_acc = knn_acc
-            best_state = {
+        checkpoint_state = {
                 "epoch": epoch,
                 "model_state_dict": model.state_dict(),
                 "optimizer_state_dict": optimizer.state_dict(),
                 "knn_accuracy": knn_acc,
                 "config": cfg,
             }
+        if checkpoint_path:
+            update_topk_checkpoints(
+                saved_checkpoints=saved_checkpoints,
+                top_k=top_k,
+                checkpoint_path=checkpoint_path,
+                state=checkpoint_state,
+                metric_name="knn",
+                metric_value=knn_acc,
+                epoch=epoch,
+            )
 
-    output_cfg = cfg.get("output", {})
-    checkpoint_path = output_cfg.get("checkpoint_path")
-    if checkpoint_path and best_state is not None:
-        os.makedirs(os.path.dirname(checkpoint_path), exist_ok=True)
-        torch.save(best_state, checkpoint_path)
-        print(f"Saved best checkpoint to: {checkpoint_path}")
+    if saved_checkpoints:
+        print("Saved top checkpoints:")
+        for checkpoint in saved_checkpoints:
+            print(f"  epoch {checkpoint['epoch']:3d} | k-NN {checkpoint['metric'] * 100:.2f}% | {checkpoint['path']}")
 
     print(f"Best k-NN accuracy: {best_acc * 100:.2f}%")
     if run is not None:
