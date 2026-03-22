@@ -11,5 +11,6 @@ scikit-learn>=1.4
 PyYAML>=6.0
 tqdm>=4.66
 wandb>=0.17
+umap-learn>=0.5
 ipykernel>=6.29
 jupyterlab>=4.2
