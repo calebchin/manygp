@@ -23,3 +23,9 @@ training:
 
 output:
   checkpoint_path: ./checkpoints/cifar10_supcon_best.pt
+
+wandb:
+  enabled: false
+  project: sngp
+  entity: sta414manygp
+  run_name: null

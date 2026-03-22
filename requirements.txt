@@ -9,5 +9,7 @@ numpy>=1.26
 matplotlib>=3.8
 scikit-learn>=1.4
 PyYAML>=6.0
+tqdm>=4.66
+wandb>=0.17
 ipykernel>=6.29
 jupyterlab>=4.2

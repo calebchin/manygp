@@ -11,6 +11,7 @@ import sys
 
 import torch
 import yaml
+from tqdm.auto import tqdm
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -23,6 +24,18 @@ def main(cfg: dict) -> None:
     smoke_test = cfg["experiment"]["smoke_test"]
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Device: {device}")
+
+    run = None
+    wandb_cfg = cfg.get("wandb", {})
+    if wandb_cfg.get("enabled", False):
+        import wandb
+
+        run = wandb.init(
+            project=wandb_cfg.get("project", "sngp"),
+            entity=wandb_cfg.get("entity") or "sta414manygp",
+            name=wandb_cfg.get("run_name") or None,
+            config=cfg,
+        )
 
     data_cfg = cfg["data"]
     train_loader, memory_loader, val_loader, train_dataset, val_dataset = get_cifar10_supcon_loaders(
@@ -57,7 +70,8 @@ def main(cfg: dict) -> None:
     best_state = None
     num_epochs = 1 if smoke_test else train_cfg["epochs"]
 
-    for epoch in range(1, num_epochs + 1):
+    epoch_progress = tqdm(range(1, num_epochs + 1), desc="Epoch", leave=True)
+    for epoch in epoch_progress:
         train_loss = train_supcon(
             model=model,
             train_loader=train_loader,
@@ -66,6 +80,7 @@ def main(cfg: dict) -> None:
             loss_fn=loss_fn,
             device=device,
             epoch=epoch,
+            show_progress=True,
         )
         metrics = evaluate_knn(
             model=model,
@@ -81,6 +96,15 @@ def main(cfg: dict) -> None:
             f"SupCon Loss: {train_loss:.4f} | "
             f"k-NN Accuracy: {knn_acc * 100:.2f}%"
         )
+        epoch_progress.set_postfix(loss=f"{train_loss:.4f}", knn=f"{knn_acc * 100:.2f}%")
+
+        if run is not None:
+            run.log({
+                "train/loss": train_loss,
+                "eval/knn_accuracy": knn_acc,
+                "train/lr": optimizer.param_groups[0]["lr"],
+                "train/epoch": epoch,
+            })
 
         if knn_acc > best_acc:
             best_acc = knn_acc
@@ -100,6 +124,9 @@ def main(cfg: dict) -> None:
         print(f"Saved best checkpoint to: {checkpoint_path}")
 
     print(f"Best k-NN accuracy: {best_acc * 100:.2f}%")
+    if run is not None:
+        run.log({"best/knn_accuracy": best_acc})
+        run.finish()
 
 
 if __name__ == "__main__":

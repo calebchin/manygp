@@ -57,11 +57,17 @@ def train_supcon(
     loss_fn: SupConLoss,
     device: torch.device,
     epoch: int,
+    show_progress: bool = True,
 ) -> float:
     model.train()
     running_loss = 0.0
 
-    progress = tqdm(train_loader, desc=f"SupCon Epoch {epoch}", leave=False)
+    progress = tqdm(
+        train_loader,
+        desc=f"SupCon Epoch {epoch}",
+        leave=False,
+        disable=not show_progress,
+    )
     for views, labels in progress:
         labels = labels.to(device, non_blocking=True)
         batch_size, num_views, channels, height, width = views.shape
