@@ -1,0 +1,25 @@
+experiment:
+  name: cifar10_supcon
+  smoke_test: false
+
+data:
+  root: ../datafolder/data
+  batch_size: 256
+  num_workers: 4
+
+model:
+  embedding_dim: 128
+  projection_dim: 128
+  projection_hidden_dim: 256
+  width: 64
+
+training:
+  epochs: 100
+  lr: 0.001
+  weight_decay: 0.0001
+  supcon_temperature: 0.07
+  knn_k: 20
+  knn_temperature: 0.1
+
+output:
+  checkpoint_path: ./checkpoints/cifar10_supcon_best.pt
