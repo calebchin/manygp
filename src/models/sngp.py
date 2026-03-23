@@ -152,6 +152,10 @@ class RandomFeatureGaussianProcess(nn.Module):
         feature_scale: float = 2.0,
         gp_cov_momentum: float = -1.0,
         normalize_input: bool = False,
+        kernel_type: str = "legacy",
+        input_normalization: str | None = None,
+        kernel_scale: float = 1.0,
+        length_scale: float = 1.0,
     ):
         super().__init__()
         self.in_features = in_features
@@ -161,11 +165,19 @@ class RandomFeatureGaussianProcess(nn.Module):
         self.feature_scale = feature_scale
         self.gp_cov_momentum = gp_cov_momentum
         self.normalize_input = normalize_input
-
-        self.register_buffer(
-            "random_weight",
-            torch.randn(in_features, num_inducing) / math.sqrt(in_features),
+        self.kernel_type = kernel_type
+        self.input_normalization = (
+            input_normalization if input_normalization is not None else ("layer_norm" if normalize_input else "none")
         )
+        self.kernel_scale = kernel_scale
+        self.length_scale = length_scale
+
+        if kernel_type == "normalized_rbf":
+            random_weight = torch.randn(in_features, num_inducing) / max(length_scale, 1e-12)
+        else:
+            random_weight = torch.randn(in_features, num_inducing) / math.sqrt(in_features)
+
+        self.register_buffer("random_weight", random_weight)
         self.register_buffer("random_bias", 2 * math.pi * torch.rand(num_inducing))
         self.beta = nn.Linear(num_inducing, out_features, bias=True)
         self.register_buffer(
@@ -181,9 +193,19 @@ class RandomFeatureGaussianProcess(nn.Module):
         )
         self.precision_matrix.copy_(self.ridge_penalty * eye.unsqueeze(0).repeat(self.out_features, 1, 1))
 
-    def _random_features(self, x: torch.Tensor) -> torch.Tensor:
-        if self.normalize_input:
+    def _normalize_features(self, x: torch.Tensor) -> torch.Tensor:
+        if self.input_normalization == "layer_norm":
             x = F.layer_norm(x, normalized_shape=(x.shape[-1],))
+        elif self.input_normalization == "l2":
+            x = F.normalize(x, p=2, dim=-1)
+        return x
+
+    def _random_features(self, x: torch.Tensor) -> torch.Tensor:
+        x = self._normalize_features(x)
+        if self.kernel_type == "normalized_rbf":
+            projection = x @ self.random_weight + self.random_bias
+            return self.kernel_scale * math.sqrt(2.0 / self.num_inducing) * torch.cos(projection)
+
         projection = self.feature_scale * (x @ self.random_weight + self.random_bias)
         return math.sqrt(2.0 / self.num_inducing) * torch.cos(projection)
 
