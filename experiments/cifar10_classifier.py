@@ -18,6 +18,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from src.data.cifar10 import get_cifar10_loaders
 from src.models.resnet import CifarResNetClassifier
+from src.utils.model_summary import print_model_summary
 
 
 def update_topk_checkpoints(
@@ -165,6 +166,7 @@ def main(cfg: dict) -> None:
         num_classes=model_cfg["num_classes"],
         width=model_cfg["width"],
     ).to(device)
+    print_model_summary(model)
 
     train_cfg = cfg["training"]
     optimizer = torch.optim.AdamW(
@@ -292,6 +294,12 @@ def main(cfg: dict) -> None:
     if run is not None:
         if best_acc >= 0.0:
             run.log({"best/val_accuracy": best_acc})
+        if saved_checkpoints:
+            import wandb
+
+            artifact = wandb.Artifact("cifar10_classifier_best_model", type="model")
+            artifact.add_file(str(saved_checkpoints[0]["path"]), name=saved_checkpoints[0]["path"].name)
+            run.log_artifact(artifact)
         run.finish()
 
 

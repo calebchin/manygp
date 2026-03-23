@@ -27,4 +27,4 @@ wandb:
   enabled: true
   project: sngp
   entity: sta414manygp
-  run_name: null
+  run_name: vanilla_dnn

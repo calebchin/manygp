@@ -22,6 +22,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from src.data.cifar10 import get_cifar10_loaders
 from src.models.frozen_sngp import FrozenBackboneSNGPClassifier, load_frozen_resnet_encoder
 from src.models.sngp import laplace_predictive_probs
+from src.utils.model_summary import print_model_summary
 
 
 def update_topk_checkpoints(
@@ -199,8 +200,7 @@ def main(cfg: dict) -> None:
         kernel_scale=model_cfg["kernel_scale"],
         length_scale=model_cfg["length_scale"],
     ).to(device)
-    print("Model architecture:")
-    print(model)
+    print_model_summary(model)
 
     train_cfg = cfg["training"]
     optimizer = torch.optim.Adam(
@@ -335,6 +335,12 @@ def main(cfg: dict) -> None:
     if run is not None:
         if best_test_nll < float("inf"):
             run.log({"best/test_nll": best_test_nll})
+        if saved_checkpoints:
+            import wandb
+
+            artifact = wandb.Artifact("cifar10_frozen_sngp_best_model", type="model")
+            artifact.add_file(str(saved_checkpoints[0]["path"]), name=saved_checkpoints[0]["path"].name)
+            run.log_artifact(artifact)
         run.finish()
 
 
