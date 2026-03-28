@@ -71,12 +71,13 @@ class TwoLayerDSPPClassifier(DSPP):
             device: torch.device
 
         Returns:
-            preds     (N,)  – argmax class predictions
-            log_probs (N,)  – per-sample log probabilities (nats)
+            preds     (N,)           – argmax class predictions
+            log_probs (N,)           – per-sample log p(true class) (nats)
+            probs     (N, num_classes) – predictive class probabilities
         """
         cnn.eval()
         self.eval()
-        all_preds, all_lls = [], []
+        all_preds, all_lls, all_probs = [], [], []
         with settings.fast_computations(log_prob=False, solves=False), torch.no_grad():
             for x_batch, y_batch in loader:
                 x_batch, y_batch = x_batch.to(device), y_batch.to(device)
@@ -87,7 +88,13 @@ class TwoLayerDSPPClassifier(DSPP):
                 batch_lp = deep_ll.logsumexp(dim=0)                          # (N,)
                 all_lls.append(batch_lp.cpu())
 
-                # output.mean: (Q, N, num_classes); average over Q then argmax
-                all_preds.append(output.mean.mean(dim=0).argmax(dim=-1).cpu())
+                # output.mean: (Q, N, num_classes)
+                # softmax per quadrature site, then quadrature-weighted average
+                w = self.quad_weights.exp()                                   # (Q,)
+                w = w / w.sum()
+                class_probs = torch.softmax(output.mean, dim=-1)              # (Q, N, C)
+                batch_probs = (w[:, None, None] * class_probs).sum(dim=0)    # (N, C)
+                all_probs.append(batch_probs.cpu())
+                all_preds.append(batch_probs.argmax(dim=-1).cpu())
 
-        return torch.cat(all_preds), torch.cat(all_lls)
+        return torch.cat(all_preds), torch.cat(all_lls), torch.cat(all_probs, dim=0)

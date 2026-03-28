@@ -171,9 +171,9 @@ def train_dspp(
 
         if eval_loader is not None and eval_y is not None and (epoch + 1) % eval_every == 0:
             metrics = evaluate_classifier(model, eval_loader, test_y=eval_y, feature_extractor=cnn, dataset_name="cifar10", device=device, run=None)
-            print(f"  Eval | Accuracy: {metrics['accuracy'] * 100:.2f}% | NLL: {metrics['nll']:.4f}")
+            print(f"  Eval | Accuracy: {metrics['accuracy'] * 100:.2f}% | NLL: {metrics['nll']:.4f} | ECE: {metrics['ece']:.4f}")
             if run is not None:
-                run.log({"eval/accuracy": metrics["accuracy"], "eval/nll": metrics["nll"], "train/epoch": epoch + 1})
+                run.log({"eval/accuracy": metrics["accuracy"], "eval/nll": metrics["nll"], "eval/ece": metrics["ece"], "train/epoch": epoch + 1})
             model.train()
 
     return epoch_losses
