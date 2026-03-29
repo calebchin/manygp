@@ -1,0 +1,30 @@
+experiment:
+  name: cifar100_classifier
+  smoke_test: false
+
+data:
+  root: ../datafolder/data
+  batch_size: 256
+  num_workers: 4
+
+model:
+  embedding_dim: 128
+  num_classes: 100
+  width: 64
+
+training:
+  epochs: 100
+  eval_interval: 5
+  log_every_steps: 20
+  lr: 0.001
+  weight_decay: 0.0001
+
+output:
+  checkpoint_path: ./checkpoints_clf/cifar100_classifier.pt
+  top_k: 10
+
+wandb:
+  enabled: true
+  project: sngp
+  entity: sta414manygp
+  run_name: cifar100_vanilla_dnn
