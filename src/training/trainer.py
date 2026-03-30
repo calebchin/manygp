@@ -201,7 +201,7 @@ def train_dkl(
         List of per-epoch average losses.
     """
     optimizer = torch.optim.Adam([
-        {'params': model.feature_extractor.parameters(), 'weight_decay': 1e-4},
+        {'params': model.feature_extractor.parameters(), 'weight_decay': 5e-4},
         {'params': model.gp_layer.hyperparameters(), 'lr': lr * 0.01},
         {'params': model.gp_layer.variational_parameters()},
         {'params': objective.parameters()},
@@ -213,6 +213,7 @@ def train_dkl(
     epochs_iter = tqdm(range(num_epochs), desc="Epoch")
     for epoch in epochs_iter:
         model.train()
+        objective.train()
         total_loss = 0.0
 
         for x_batch, y_batch in tqdm(train_loader, desc="Minibatch", leave=False):
