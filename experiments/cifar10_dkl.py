@@ -61,10 +61,15 @@ def main(cfg: dict, config_path: str) -> None:
 
     # ── CNN pretraining ───────────────────────────────────────────────────────
     cnn_cfg = cfg["cnn"]
-    cnn = CNNFeatureExtractor(
-        latent_dim=cnn_cfg["latent_dim"],
-        num_classes=cnn_cfg["num_classes"],
+    cnn = WideResNet(
+        input_size=32,
+        spectral_conv=False,
+        spectral_bn=False
     ).to(device)
+    # cnn = CNNFeatureExtractor(
+    #     latent_dim=cnn_cfg["latent_dim"],
+    #     num_classes=cnn_cfg["num_classes"],
+    # ).to(device)
 
     # ── Inducing point initialisation ─────────────────────────────────────────
     dkl_cfg = cfg["dkl"]
