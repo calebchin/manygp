@@ -18,9 +18,9 @@ from gpytorch.likelihoods import SoftmaxLikelihood
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from src.data.cifar10 import get_cifar10_loaders
+from src.models.due.wide_resnet import WideResNet
 from src.models.feature_extractors import CNNFeatureExtractor
-from src.models.gp_layers import GP
-from src.models.dkl import DKLModel
+from src.models.dkl import GP, DKLModel
 from src.training.trainer import (
     extract_cnn_features,
     init_inducing_points_kmeans,
@@ -59,25 +59,17 @@ def main(cfg: dict, config_path: str) -> None:
     )
     print(f"Train size: {len(dataset_train)}, test size: {len(dataset_test)}")
 
-    # ── CNN pretraining ───────────────────────────────────────────────────────
+    # ── CNN initialiation ───────────────────────────────────────────────────────
     cnn_cfg = cfg["cnn"]
+    # cnn = WideResNet(
+    #     input_size=32,
+    #     spectral_conv=False,
+    #     spectral_bn=False
+    # ).to(device)
     cnn = CNNFeatureExtractor(
         latent_dim=cnn_cfg["latent_dim"],
         num_classes=cnn_cfg["num_classes"],
     ).to(device)
-
-    # # Evaluate CNN standalone accuracy
-    # cnn.eval()
-    # correct = total = 0
-    # with torch.no_grad():
-    #     for x_batch, y_batch in test_loader:
-    #         preds = cnn.forward_cls(x_batch.to(device)).argmax(dim=-1).cpu()
-    #         correct += (preds == y_batch).sum().item()
-    #         total += y_batch.size(0)
-    # cnn_accuracy = correct / total
-    # print(f"CNN standalone test accuracy: {cnn_accuracy * 100:.2f}%")
-    # if run is not None:
-    #     run.log({"pretrain/cnn_accuracy": cnn_accuracy})
 
     # ── Inducing point initialisation ─────────────────────────────────────────
     dkl_cfg = cfg["dkl"]
@@ -90,17 +82,19 @@ def main(cfg: dict, config_path: str) -> None:
     inducing = init_inducing_points_kmeans(pool, dkl_cfg["num_inducing_pts"]).to(device)
     print(f"Inducing points shape: {inducing.shape}")
 
-    # ── DSPP model ────────────────────────────────────────────────────────────
+    # ── DKL model ────────────────────────────────────────────────────────────
+    dp_num_output = inducing.shape[1] if dkl_cfg["per_feature"] else dkl_cfg["num_output"]
     gp = GP(
         inducing_points=inducing,
         num_inducing=dkl_cfg["num_inducing_pts"],
-        num_output=dkl_cfg["num_output"],
+        num_output=dp_num_output,
         per_feature=dkl_cfg["per_feature"]
     ).to(device)
-    dkl = DKLModel(cnn, gp, per_feature=dkl_cfg["per_feature"]).to(device)
+    
+    objective = SoftmaxLikelihood(num_features=dp_num_output, num_classes=cnn_cfg["num_classes"]).to(device)
+    dkl = DKLModel(cnn, gp, objective, per_feature=dkl_cfg["per_feature"]).to(device)
 
     train_cfg = cfg["training"]
-    objective = SoftmaxLikelihood(num_features=dkl_cfg["num_output"], num_classes=cnn_cfg["num_classes"]).to(device)
 
     # ── Training ──────────────────────────────────────────────────────────────
     num_epochs = 1 if smoke_test else train_cfg["num_epochs"]
