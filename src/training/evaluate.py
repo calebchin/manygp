@@ -142,7 +142,12 @@ def evaluate_classifier(model, test_loader: DataLoader, test_y: torch.Tensor, fe
     """
     preds, log_probs, probs = model.predict(test_loader, cnn=feature_extractor, device=device)
 
-    labels = test_y.cpu()
+    # Collect ground-truth labels
+    all_labels = []
+    for _, y_batch in test_loader:
+        all_labels.append(y_batch)
+    labels = torch.cat(all_labels)
+    print(preds[:10], labels[:10])
 
     accuracy = (preds == labels).float().mean().item()
     nll = -log_probs.mean().item()
