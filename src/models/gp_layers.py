@@ -2,9 +2,8 @@ import torch
 import gpytorch
 from gpytorch.means import ConstantMean, LinearMean
 from gpytorch.kernels import ScaleKernel, MaternKernel
-from gpytorch.variational import VariationalStrategy, MeanFieldVariationalDistribution, IndependentMultitaskVariationalStrategy, GridInterpolationVariationalStrategy
+from gpytorch.variational import VariationalStrategy, MeanFieldVariationalDistribution
 from gpytorch.models.deep_gps.dspp import DSPPLayer
-
 from gpytorch.variational import VariationalStrategy
 
 class DSPPHiddenLayer(DSPPLayer):
@@ -72,3 +71,4 @@ class DSPPHiddenLayer(DSPPLayer):
         mean_x = self.mean_module(x)
         covar_x = self.covar_module(x)
         return gpytorch.distributions.MultivariateNormal(mean_x, covar_x)
+
