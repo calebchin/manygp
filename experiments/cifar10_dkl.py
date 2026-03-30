@@ -59,13 +59,8 @@ def main(cfg: dict, config_path: str) -> None:
     )
     print(f"Train size: {len(dataset_train)}, test size: {len(dataset_test)}")
 
-    # ── CNN initialiation ───────────────────────────────────────────────────────
+    # ── CNN pretraining ───────────────────────────────────────────────────────
     cnn_cfg = cfg["cnn"]
-    # cnn = WideResNet(
-    #     input_size=32,
-    #     spectral_conv=False,
-    #     spectral_bn=False
-    # ).to(device)
     cnn = CNNFeatureExtractor(
         latent_dim=cnn_cfg["latent_dim"],
         num_classes=cnn_cfg["num_classes"],
@@ -82,19 +77,17 @@ def main(cfg: dict, config_path: str) -> None:
     inducing = init_inducing_points_kmeans(pool, dkl_cfg["num_inducing_pts"]).to(device)
     print(f"Inducing points shape: {inducing.shape}")
 
-    # ── DKL model ────────────────────────────────────────────────────────────
-    dp_num_output = inducing.shape[1] if dkl_cfg["per_feature"] else dkl_cfg["num_output"]
+    # ── DSPP model ────────────────────────────────────────────────────────────
     gp = GP(
         inducing_points=inducing,
         num_inducing=dkl_cfg["num_inducing_pts"],
-        num_output=dp_num_output,
+        num_output=dkl_cfg["num_output"],
         per_feature=dkl_cfg["per_feature"]
     ).to(device)
-    
-    objective = SoftmaxLikelihood(num_features=dp_num_output, num_classes=cnn_cfg["num_classes"]).to(device)
-    dkl = DKLModel(cnn, gp, objective, per_feature=dkl_cfg["per_feature"]).to(device)
+    dkl = DKLModel(cnn, gp, per_feature=dkl_cfg["per_feature"]).to(device)
 
     train_cfg = cfg["training"]
+    objective = SoftmaxLikelihood(num_features=dkl_cfg["num_output"], num_classes=cnn_cfg["num_classes"]).to(device)
 
     # ── Training ──────────────────────────────────────────────────────────────
     num_epochs = 1 if smoke_test else train_cfg["num_epochs"]

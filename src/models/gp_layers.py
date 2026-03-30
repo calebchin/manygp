@@ -4,7 +4,8 @@ from gpytorch.means import ConstantMean, LinearMean
 from gpytorch.kernels import ScaleKernel, MaternKernel
 from gpytorch.variational import VariationalStrategy, MeanFieldVariationalDistribution, IndependentMultitaskVariationalStrategy, GridInterpolationVariationalStrategy
 from gpytorch.models.deep_gps.dspp import DSPPLayer
-
+from gpytorch.models import ApproximateGP
+from gpytorch.variational import CholeskyVariationalDistribution
 from gpytorch.variational import VariationalStrategy
 
 class DSPPHiddenLayer(DSPPLayer):
@@ -69,6 +70,43 @@ class DSPPHiddenLayer(DSPPLayer):
         )
 
     def forward(self, x, mean_input=None, **kwargs):
+        mean_x = self.mean_module(x)
+        covar_x = self.covar_module(x)
+        return gpytorch.distributions.MultivariateNormal(mean_x, covar_x)
+
+
+class GP(ApproximateGP):
+    # TODO: Add support for different kernels
+    def __init__(self, inducing_points, num_inducing, num_output=1, per_feature=False):
+        
+        if per_feature:
+            # Learn a separate GP for each feature (e.g. for DKL)
+            inducing_points = inducing_points.transpose(-1, -2).unsqueeze(-1)
+            batch_shape = torch.Size([num_output])
+        elif num_output > 1:
+            batch_shape = torch.Size([num_output])
+        else:
+            batch_shape = torch.Size([])
+
+            
+        variational_distribution = CholeskyVariationalDistribution(
+            num_inducing, batch_shape=batch_shape
+        )
+
+        variational_strategy = VariationalStrategy(
+            self, inducing_points, variational_distribution, learn_inducing_locations=True
+        )
+
+        if num_output > 1:
+            variational_strategy = IndependentMultitaskVariationalStrategy(
+                variational_strategy, num_tasks=num_output
+            )
+        
+        super(GP, self).__init__(variational_strategy)
+        self.mean_module = gpytorch.means.ConstantMean()
+        self.covar_module = gpytorch.kernels.ScaleKernel(gpytorch.kernels.RBFKernel())
+
+    def forward(self, x):
         mean_x = self.mean_module(x)
         covar_x = self.covar_module(x)
         return gpytorch.distributions.MultivariateNormal(mean_x, covar_x)
