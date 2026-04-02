@@ -1,7 +1,7 @@
 import torch
 import torchvision
 import torchvision.transforms as transforms
-from torch.utils.data import DataLoader, TensorDataset
+from torch.utils.data import DataLoader, Subset, TensorDataset
 
 
 _CIFAR10_MEAN = (0.4914, 0.4822, 0.4465)
@@ -26,30 +26,42 @@ def get_cifar10_loaders(
     batch_size: int,
     num_workers: int = 0,
     smoke_test: bool = False,
+    val_split: float = 0.1,
 ):
     """
-    Returns CIFAR-10 DataLoaders.
+    Returns CIFAR-10 DataLoaders with a train / val / test split.
+
+    The training set (50 000 samples) is split into a training subset and a
+    validation subset using a fixed random seed so results are reproducible.
+    The held-out test set (10 000 samples) is never used for checkpoint
+    selection.
 
     Args:
         data_root:   Directory to download / read CIFAR-10 from.
         batch_size:  Mini-batch size.
         num_workers: DataLoader worker processes.
-        smoke_test:  If True, returns tiny synthetic datasets (200 train, 50 test).
+        smoke_test:  If True, returns tiny synthetic datasets (160/40/50).
+        val_split:   Fraction of the 50K training set to use as validation.
 
     Returns:
-        train_loader, test_loader, dataset_train, dataset_test
-        (dataset_train / dataset_test expose .targets for evaluation)
+        train_loader, val_loader, test_loader,
+        dataset_train, dataset_val, dataset_test
     """
     if smoke_test:
+        n_train, n_val, n_test = 160, 40, 50
         dataset_train = TensorDataset(
-            torch.randn(200, 3, 32, 32), torch.randint(0, 10, (200,))
+            torch.randn(n_train, 3, 32, 32), torch.randint(0, 10, (n_train,))
+        )
+        dataset_val = TensorDataset(
+            torch.randn(n_val, 3, 32, 32), torch.randint(0, 10, (n_val,))
         )
         dataset_test = TensorDataset(
-            torch.randn(50, 3, 32, 32), torch.randint(0, 10, (50,))
+            torch.randn(n_test, 3, 32, 32), torch.randint(0, 10, (n_test,))
         )
         train_loader = DataLoader(dataset_train, batch_size=batch_size, shuffle=True)
+        val_loader = DataLoader(dataset_val, batch_size=batch_size, shuffle=False)
         test_loader = DataLoader(dataset_test, batch_size=batch_size, shuffle=False)
-        return train_loader, test_loader, dataset_train, dataset_test
+        return train_loader, val_loader, test_loader, dataset_train, dataset_val, dataset_test
 
     transform_train = transforms.Compose([
         transforms.RandomHorizontalFlip(),
@@ -57,24 +69,45 @@ def get_cifar10_loaders(
         transforms.ToTensor(),
         transforms.Normalize(_CIFAR10_MEAN, _CIFAR10_STD),
     ])
-    transform_test = transforms.Compose([
+    transform_eval = transforms.Compose([
         transforms.ToTensor(),
         transforms.Normalize(_CIFAR10_MEAN, _CIFAR10_STD),
     ])
 
-    dataset_train = torchvision.datasets.CIFAR10(
+    # Two handles to the same underlying train data, different transforms.
+    # Using Subset lets the val split get eval (no augmentation) transforms.
+    dataset_train_aug = torchvision.datasets.CIFAR10(
         root=data_root, train=True, download=True, transform=transform_train
     )
-    dataset_test = torchvision.datasets.CIFAR10(
-        root=data_root, train=False, download=True, transform=transform_test
+    dataset_train_eval = torchvision.datasets.CIFAR10(
+        root=data_root, train=True, download=True, transform=transform_eval
     )
+    dataset_test = torchvision.datasets.CIFAR10(
+        root=data_root, train=False, download=True, transform=transform_eval
+    )
+
+    n_total = len(dataset_train_aug)  # 50 000
+    n_val = int(n_total * val_split)  # 5 000
+    n_train = n_total - n_val         # 45 000
+
+    rng = torch.Generator().manual_seed(42)
+    perm = torch.randperm(n_total, generator=rng)
+    train_indices = perm[:n_train].tolist()
+    val_indices = perm[n_train:].tolist()
+
+    dataset_train = Subset(dataset_train_aug, train_indices)
+    dataset_val = Subset(dataset_train_eval, val_indices)
+
     train_loader = DataLoader(
         dataset_train, batch_size=batch_size, shuffle=True, num_workers=num_workers
+    )
+    val_loader = DataLoader(
+        dataset_val, batch_size=batch_size, shuffle=False, num_workers=num_workers
     )
     test_loader = DataLoader(
         dataset_test, batch_size=batch_size, shuffle=False, num_workers=num_workers
     )
-    return train_loader, test_loader, dataset_train, dataset_test
+    return train_loader, val_loader, test_loader, dataset_train, dataset_val, dataset_test
 
 
 def get_cifar10_supcon_loaders(
@@ -82,30 +115,43 @@ def get_cifar10_supcon_loaders(
     batch_size: int,
     num_workers: int = 0,
     smoke_test: bool = False,
+    val_split: float = 0.1,
 ):
     """
-    Returns CIFAR-10 loaders for supervised contrastive training and k-NN eval.
+    Returns CIFAR-10 loaders for supervised contrastive training and evaluation.
 
-    The training loader yields `(views, labels)` where `views` has shape
-    `(batch_size, 2, 3, 32, 32)`. Evaluation loaders use deterministic
-    preprocessing for stable embedding extraction.
+    The 50K training set is split into a contrastive-training subset and a
+    validation subset (eval transforms, no augmentation).  The 10K test set
+    is returned as a separate held-out loader.
+
+    The training loader yields ``(views, labels)`` where ``views`` has shape
+    ``(batch_size, 2, 3, 32, 32)``.
+
+    Returns:
+        train_loader, memory_loader, val_loader, test_loader,
+        dataset_train, dataset_val, dataset_test
     """
     if smoke_test:
-        train_images = torch.randn(200, 3, 32, 32)
-        train_labels = torch.randint(0, 10, (200,))
-        test_images = torch.randn(50, 3, 32, 32)
-        test_labels = torch.randint(0, 10, (50,))
+        n_train, n_val, n_test = 160, 40, 50
+        train_images = torch.randn(n_train, 3, 32, 32)
+        train_labels = torch.randint(0, 10, (n_train,))
+        val_images = torch.randn(n_val, 3, 32, 32)
+        val_labels = torch.randint(0, 10, (n_val,))
+        test_images = torch.randn(n_test, 3, 32, 32)
+        test_labels = torch.randint(0, 10, (n_test,))
 
         train_contrastive = TensorDataset(
             train_images.unsqueeze(1).repeat(1, 2, 1, 1, 1), train_labels
         )
-        train_eval = TensorDataset(train_images, train_labels)
-        test_eval = TensorDataset(test_images, test_labels)
+        train_eval_ds = TensorDataset(train_images, train_labels)
+        val_ds = TensorDataset(val_images, val_labels)
+        test_ds = TensorDataset(test_images, test_labels)
 
         train_loader = DataLoader(train_contrastive, batch_size=batch_size, shuffle=True)
-        memory_loader = DataLoader(train_eval, batch_size=batch_size, shuffle=False)
-        val_loader = DataLoader(test_eval, batch_size=batch_size, shuffle=False)
-        return train_loader, memory_loader, val_loader, train_contrastive, test_eval
+        memory_loader = DataLoader(train_eval_ds, batch_size=batch_size, shuffle=False)
+        val_loader = DataLoader(val_ds, batch_size=batch_size, shuffle=False)
+        test_loader = DataLoader(test_ds, batch_size=batch_size, shuffle=False)
+        return train_loader, memory_loader, val_loader, test_loader, train_contrastive, val_ds, test_ds
 
     contrastive_transform = transforms.Compose([
         transforms.RandomResizedCrop(32, scale=(0.6, 1.0)),
@@ -123,13 +169,14 @@ def get_cifar10_supcon_loaders(
         transforms.Normalize(_CIFAR10_MEAN, _CIFAR10_STD),
     ])
 
-    train_contrastive_dataset = torchvision.datasets.CIFAR10(
+    # Three handles to training data: contrastive aug, eval transforms (x2)
+    train_contrastive_full = torchvision.datasets.CIFAR10(
         root=data_root,
         train=True,
         download=True,
         transform=TwoCropTransform(contrastive_transform),
     )
-    train_eval_dataset = torchvision.datasets.CIFAR10(
+    train_eval_full = torchvision.datasets.CIFAR10(
         root=data_root,
         train=True,
         download=True,
@@ -142,6 +189,22 @@ def get_cifar10_supcon_loaders(
         transform=eval_transform,
     )
 
+    n_total = len(train_contrastive_full)  # 50 000
+    n_val = int(n_total * val_split)       # 5 000
+    n_train = n_total - n_val              # 45 000
+
+    rng = torch.Generator().manual_seed(42)
+    perm = torch.randperm(n_total, generator=rng)
+    train_indices = perm[:n_train].tolist()
+    val_indices = perm[n_train:].tolist()
+
+    # Contrastive training uses train_indices with TwoCropTransform
+    train_contrastive_dataset = Subset(train_contrastive_full, train_indices)
+    # Memory loader (k-NN / embedding extraction) uses same indices, eval transforms
+    train_memory_dataset = Subset(train_eval_full, train_indices)
+    # Val uses disjoint indices, eval transforms
+    val_dataset = Subset(train_eval_full, val_indices)
+
     train_loader = DataLoader(
         train_contrastive_dataset,
         batch_size=batch_size,
@@ -151,17 +214,32 @@ def get_cifar10_supcon_loaders(
         drop_last=True,
     )
     memory_loader = DataLoader(
-        train_eval_dataset,
+        train_memory_dataset,
         batch_size=batch_size,
         shuffle=False,
         num_workers=num_workers,
         pin_memory=True,
     )
     val_loader = DataLoader(
+        val_dataset,
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=num_workers,
+        pin_memory=True,
+    )
+    test_loader = DataLoader(
         test_eval_dataset,
         batch_size=batch_size,
         shuffle=False,
         num_workers=num_workers,
         pin_memory=True,
     )
-    return train_loader, memory_loader, val_loader, train_contrastive_dataset, test_eval_dataset
+    return (
+        train_loader,
+        memory_loader,
+        val_loader,
+        test_loader,
+        train_contrastive_dataset,
+        val_dataset,
+        test_eval_dataset,
+    )

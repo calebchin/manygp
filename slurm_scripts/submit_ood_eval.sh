@@ -5,8 +5,8 @@
 #SBATCH --mem=16G
 #SBATCH --gres=gpu:1
 #SBATCH --time=4:00:00
-#SBATCH --output=/w/20251/cchin/manygp/manygp/logs/%j.out
-#SBATCH --error=/w/20251/cchin/manygp/manygp/logs/%j.err
+#SBATCH --output=/w/20252/davida/manygp_logs/%j.out
+#SBATCH --error=/w/20252/davida/manygp_logs/%j.err
 
 # Usage:
 #   sbatch submit_ood_eval.sh <dataset>
@@ -39,12 +39,12 @@ case "$DATASET" in
         ;;
 esac
 
-REPO=/w/20251/cchin/manygp/manygp
+REPO=/w/20252/davida/manygp/manygp
 
+mkdir -p /w/20252/davida/manygp_logs
 cd $REPO
-mkdir -p $REPO/logs
 
-source $REPO/.venv/bin/activate
+source /w/20252/davida/venv/bin/activate
 
 echo "Running ${DATASET} OOD evaluation..."
 

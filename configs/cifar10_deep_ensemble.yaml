@@ -1,5 +1,5 @@
 experiment:
-  name: cifar10_classifier
+  name: cifar10_deep_ensemble
   smoke_test: false
 
 data:
@@ -12,6 +12,10 @@ model:
   num_classes: 10
   width: 64
 
+ensemble:
+  num_members: 5
+  seeds: [0, 1, 2, 3, 4]
+
 training:
   epochs: 100
   eval_interval: 5
@@ -20,11 +24,10 @@ training:
   weight_decay: 0.0001
 
 output:
-  checkpoint_path: ./checkpoints_clf/cifar10_classifier.pt
-  top_k: 10
+  checkpoint_dir: ./checkpoints_ensemble_cifar10/
 
 wandb:
   enabled: true
   project: Updated_run
   entity: sta414manygp
-  run_name: vanilla_dnn
+  run_name: deep_ensemble_cifar10

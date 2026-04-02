@@ -136,7 +136,7 @@ def main(cfg: dict) -> None:
     # 3. OOD detection: CIFAR-10 (hard)
     # -------------------------------------------------------------------------
     print("\n=== OOD detection: CIFAR-10 (hard) ===")
-    _, cifar10_ood_loader, _, _ = get_cifar10_loaders(
+    _, _, cifar10_ood_loader, _, _, _ = get_cifar10_loaders(
         data_root=data_root,
         batch_size=batch_size,
         num_workers=num_workers,

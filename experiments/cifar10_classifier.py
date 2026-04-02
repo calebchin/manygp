@@ -152,13 +152,13 @@ def main(cfg: dict) -> None:
         )
 
     data_cfg = cfg["data"]
-    train_loader, val_loader, train_dataset, val_dataset = get_cifar10_loaders(
+    train_loader, val_loader, test_loader, train_dataset, val_dataset, test_dataset = get_cifar10_loaders(
         data_root=data_cfg["root"],
         batch_size=data_cfg["batch_size"],
         num_workers=data_cfg["num_workers"],
         smoke_test=smoke_test,
     )
-    print(f"Train size: {len(train_dataset)}, val size: {len(val_dataset)}")
+    print(f"Train size: {len(train_dataset)}, val size: {len(val_dataset)}, test size: {len(test_dataset)}")
 
     model_cfg = cfg["model"]
     model = CifarResNetClassifier(

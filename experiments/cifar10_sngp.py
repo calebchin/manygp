@@ -19,6 +19,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from src.data.cifar10 import get_cifar10_loaders
 from src.models.sngp import SNGPResNetClassifier, laplace_predictive_probs
+from src.training.evaluate import _classification_ece
 from src.utils.model_summary import print_model_summary
 
 
@@ -117,6 +118,8 @@ def evaluate_sngp(
     total_correct = 0
     total_examples = 0
     total_nll = 0.0
+    all_probs: list[torch.Tensor] = []
+    all_labels: list[torch.Tensor] = []
 
     for images, labels in loader:
         images = images.to(device, non_blocking=True)
@@ -130,11 +133,18 @@ def evaluate_sngp(
         total_correct += (probs.argmax(dim=1) == labels).sum().item()
         total_examples += labels.size(0)
         total_nll += -log_probs.gather(1, labels.unsqueeze(1)).sum().item()
+        all_probs.append(probs.cpu())
+        all_labels.append(labels.cpu())
+
+    all_probs_t = torch.cat(all_probs, dim=0)
+    all_labels_t = torch.cat(all_labels, dim=0)
+    ece = _classification_ece(all_probs_t, all_labels_t)
 
     return {
         "loss": running_loss / len(loader),
         "accuracy": total_correct / total_examples,
         "nll": total_nll / total_examples,
+        "ece": ece,
     }
 
 
@@ -142,6 +152,18 @@ def main(cfg: dict) -> None:
     smoke_test = cfg["experiment"]["smoke_test"]
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Device: {device}")
+
+    # Reproducibility
+    seed = cfg.get("training", {}).get("seed", None)
+    if seed is not None:
+        import random
+        import numpy as np
+        random.seed(seed)
+        np.random.seed(seed)
+        torch.manual_seed(seed)
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed_all(seed)
+        print(f"Random seed: {seed}")
 
     run = None
     wandb_cfg = cfg.get("wandb", {})
@@ -156,13 +178,13 @@ def main(cfg: dict) -> None:
         )
 
     data_cfg = cfg["data"]
-    train_loader, val_loader, train_dataset, val_dataset = get_cifar10_loaders(
+    train_loader, val_loader, test_loader, train_dataset, val_dataset, test_dataset = get_cifar10_loaders(
         data_root=data_cfg["root"],
         batch_size=data_cfg["batch_size"],
         num_workers=data_cfg["num_workers"],
         smoke_test=smoke_test,
     )
-    print(f"Train size: {len(train_dataset)}, val size: {len(val_dataset)}")
+    print(f"Train size: {len(train_dataset)}, val size: {len(val_dataset)}, test size: {len(test_dataset)}")
 
     model_cfg = cfg["model"]
     model = SNGPResNetClassifier(
@@ -219,6 +241,7 @@ def main(cfg: dict) -> None:
         val_loss = None
         val_acc = None
         val_nll = None
+        val_ece = None
         if should_evaluate:
             metrics = evaluate_sngp(
                 model=model,
@@ -229,13 +252,15 @@ def main(cfg: dict) -> None:
             val_loss = metrics["loss"]
             val_acc = metrics["accuracy"]
             val_nll = metrics["nll"]
+            val_ece = metrics["ece"]
             print(
                 f"Epoch {epoch:3d}/{num_epochs} | "
                 f"Train Loss: {train_loss:.4f} | "
                 f"Train Acc: {train_acc * 100:.2f}% | "
                 f"Val Loss: {val_loss:.4f} | "
                 f"Val Acc: {val_acc * 100:.2f}% | "
-                f"Val NLL: {val_nll:.4f}"
+                f"Val NLL: {val_nll:.4f} | "
+                f"Val ECE: {val_ece:.4f}"
             )
             epoch_progress.set_postfix(
                 train_loss=f"{train_loss:.4f}",
@@ -261,9 +286,10 @@ def main(cfg: dict) -> None:
                 "train/epoch": epoch,
             }
             if val_loss is not None and val_acc is not None and val_nll is not None:
-                log_data["eval/loss"] = val_loss
-                log_data["eval/accuracy"] = val_acc
-                log_data["eval/nll"] = val_nll
+                log_data["val/loss"] = val_loss
+                log_data["val/accuracy"] = val_acc
+                log_data["val/nll"] = val_nll
+                log_data["val/ece"] = val_ece
             run.log(log_data)
 
         if val_acc is None:
@@ -278,6 +304,7 @@ def main(cfg: dict) -> None:
             "val_accuracy": val_acc,
             "val_loss": val_loss,
             "val_nll": val_nll,
+            "val_ece": val_ece,
             "config": cfg,
         }
         if checkpoint_path:
@@ -305,9 +332,38 @@ def main(cfg: dict) -> None:
     else:
         print("Best validation accuracy: not evaluated")
 
+    # ── Test evaluation using best checkpoint ─────────────────────────────────
+    test_metrics: dict[str, float] | None = None
+    if saved_checkpoints:
+        import shutil
+
+        best_ckpt = torch.load(saved_checkpoints[0]["path"], map_location=device, weights_only=False)
+        model.load_state_dict(best_ckpt["model_state_dict"])
+
+        # Save a fixed-name copy for downstream OOD evaluation
+        best_model_path = saved_checkpoints[0]["path"].parent / "best_model.pt"
+        shutil.copy2(saved_checkpoints[0]["path"], best_model_path)
+        print(f"Best model saved to: {best_model_path}")
+
+        print("\nEvaluating best checkpoint on held-out test set...")
+        test_metrics = evaluate_sngp(model, test_loader, device, num_mc_samples)
+        print(
+            f"Test Acc: {test_metrics['accuracy'] * 100:.2f}% | "
+            f"Test NLL: {test_metrics['nll']:.4f} | "
+            f"Test ECE: {test_metrics['ece']:.4f}"
+        )
+
     if run is not None:
         if best_acc >= 0.0:
             run.log({"best/val_accuracy": best_acc})
+        if test_metrics is not None:
+            run.log({
+                "test/accuracy": test_metrics["accuracy"],
+                "test/nll": test_metrics["nll"],
+                "test/ece": test_metrics["ece"],
+                "test/loss": test_metrics["loss"],
+                "best/test_accuracy": test_metrics["accuracy"],
+            })
         if saved_checkpoints:
             import wandb
 
@@ -320,9 +376,21 @@ def main(cfg: dict) -> None:
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="CIFAR-10 SNGP experiment")
     parser.add_argument("--config", required=True, help="Path to YAML config file")
+    parser.add_argument("--seed", type=int, default=None, help="Random seed (overrides config)")
+    parser.add_argument("--run-name", type=str, default=None, dest="run_name",
+                        help="W&B run name (overrides config)")
     args = parser.parse_args()
 
     with open(args.config) as f:
         cfg = yaml.safe_load(f)
+
+    if args.seed is not None:
+        cfg.setdefault("training", {})["seed"] = args.seed
+        # Keep checkpoint dirs separate per seed to avoid collisions
+        if cfg.get("output", {}).get("checkpoint_path"):
+            p = Path(cfg["output"]["checkpoint_path"])
+            cfg["output"]["checkpoint_path"] = str(p.parent / f"seed{args.seed}" / p.name)
+    if args.run_name:
+        cfg.setdefault("wandb", {})["run_name"] = args.run_name
 
     main(cfg)

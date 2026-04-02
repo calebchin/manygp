@@ -50,7 +50,7 @@ def main(cfg: dict, config_path: str) -> None:
         run.log_artifact(config_artifact)
 
     # ── Data ──────────────────────────────────────────────────────────────────
-    train_loader, test_loader, dataset_train, dataset_test = get_cifar10_loaders(
+    train_loader, _, test_loader, dataset_train, _, dataset_test = get_cifar10_loaders(
         data_root=cfg["data"]["root"],
         batch_size=cfg["data"]["batch_size"],
         num_workers=cfg["data"]["num_workers"],

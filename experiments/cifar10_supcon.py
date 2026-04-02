@@ -76,7 +76,7 @@ def main(cfg: dict) -> None:
         )
 
     data_cfg = cfg["data"]
-    train_loader, memory_loader, val_loader, train_dataset, val_dataset = get_cifar10_supcon_loaders(
+    train_loader, memory_loader, val_loader, _, train_dataset, val_dataset, _ = get_cifar10_supcon_loaders(
         data_root=data_cfg["root"],
         batch_size=data_cfg["batch_size"],
         num_workers=data_cfg["num_workers"],

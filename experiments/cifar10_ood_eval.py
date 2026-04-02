@@ -75,7 +75,7 @@ def main(cfg: dict) -> None:
     # 1. In-distribution: CIFAR-10 test set
     # -------------------------------------------------------------------------
     print("\n=== In-distribution: CIFAR-10 test ===")
-    _, id_loader, _, _ = get_cifar10_loaders(
+    _, _, id_loader, _, _, _ = get_cifar10_loaders(
         data_root=data_root,
         batch_size=batch_size,
         num_workers=num_workers,

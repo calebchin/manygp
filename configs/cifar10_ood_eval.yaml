@@ -2,9 +2,9 @@ experiment:
   name: cifar10_ood_eval
 
 model:
-  # Path to a trained CIFAR-10 checkpoint (any model type).
-  # The model type is inferred from checkpoint['config']['experiment']['name'].
-  checkpoint_path: ./checkpoints_sngp/cifar10_sngp_epoch100_acc0.9400.pt
+  # Path to the best trained CIFAR-10 checkpoint (written by training scripts).
+  # Replace <model> with: checkpoints_sngp, checkpoints_supcon_sngp, or checkpoints_ensemble_cifar10
+  checkpoint_path: ./checkpoints_sngp/best_model.pt
   num_mc_samples: 10
 
 data:
@@ -25,7 +25,7 @@ output:
   csv_path: ./results/cifar10_ood_cifarc.csv
 
 wandb:
-  enabled: false
-  project: sngp
+  enabled: true
+  project: Updated_run
   entity: sta414manygp
   run_name: cifar10_ood_eval
