@@ -63,8 +63,8 @@ def main(cfg: dict, config_path: str) -> None:
     cnn_cfg = cfg["cnn"]
     cnn = WideResNet(
         input_size=32,
-        spectral_conv=False,
-        spectral_bn=False
+        spectral_conv=cnn_cfg["spectral_conv"],
+        spectral_bn=cnn_cfg["spectral_bn"]
     ).to(device)
     # cnn = CNNFeatureExtractor(
     #     latent_dim=cnn_cfg["latent_dim"],

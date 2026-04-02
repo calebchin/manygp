@@ -5,6 +5,7 @@ import torch
 from scipy.cluster.vq import kmeans2
 from tqdm.auto import tqdm
 from gpytorch.mlls import VariationalELBO
+from src.training.evaluate import evaluate_classifier
 
 
 def init_inducing_points_kmeans(data_tensor: torch.Tensor, n_points: int) -> torch.Tensor:
@@ -309,7 +310,9 @@ def train_dkl(
         avg_loss = total_loss / len(train_loader)
         epoch_losses.append(avg_loss)
         epochs_iter.set_postfix(loss=avg_loss)
+
         print(f"Epoch {epoch + 1:3d}/{num_epochs} | Loss: {avg_loss:.4f}")
+
         if run is not None:
             run.log({
                 "train/loss": avg_loss,
