@@ -1,8 +1,10 @@
 import torch
 import torchvision
 import torchvision.transforms as transforms
-from torch.utils.data import DataLoader, Subset, TensorDataset
+from torch.utils.data import DataLoader, Subset, TensorDataset, Sampler
 
+import random
+from collections import defaultdict
 
 _CIFAR10_MEAN = (0.4914, 0.4822, 0.4465)
 _CIFAR10_STD = (0.2470, 0.2435, 0.2616)
@@ -20,6 +22,45 @@ class TwoCropTransform:
             dim=0,
         )
 
+class MinPerClassSampler(Sampler):
+    def __init__(self, labels, batch_size, min_per_class=2):
+        self.labels = torch.tensor(labels)
+        self.batch_size = batch_size
+        self.min_per_class = min_per_class
+
+        self.class_to_indices = defaultdict(list)
+        for idx, label in enumerate(self.labels):
+            self.class_to_indices[int(label)].append(idx)
+
+        self.classes = list(self.class_to_indices.keys())
+        self.num_classes = len(self.classes)
+
+    def __iter__(self):
+        while True:
+            batch = []
+
+            # Step 1: ensure minimum per class (sample subset of classes)
+            selected_classes = random.sample(
+                self.classes,
+                min(self.num_classes, self.batch_size // self.min_per_class)
+            )
+
+            for cls in selected_classes:
+                indices = self.class_to_indices[cls]
+                sampled = random.choices(indices, k=self.min_per_class)
+                batch.extend(sampled)
+
+            # Step 2: fill rest randomly
+            remaining = self.batch_size - len(batch)
+            if remaining > 0:
+                all_indices = list(range(len(self.labels)))
+                batch.extend(random.choices(all_indices, k=remaining))
+
+            random.shuffle(batch)
+            yield batch
+
+    def __len__(self):
+        return len(self.labels) // self.batch_size
 
 def get_cifar10_loaders(
     data_root: str,
@@ -116,6 +157,8 @@ def get_cifar10_supcon_loaders(
     num_workers: int = 0,
     smoke_test: bool = False,
     val_split: float = 0.1,
+    no_aug: bool = False,
+    min_per_class: int = 2,
 ):
     """
     Returns CIFAR-10 loaders for supervised contrastive training and evaluation.
@@ -147,7 +190,11 @@ def get_cifar10_supcon_loaders(
         val_ds = TensorDataset(val_images, val_labels)
         test_ds = TensorDataset(test_images, test_labels)
 
-        train_loader = DataLoader(train_contrastive, batch_size=batch_size, shuffle=True)
+        if no_aug:
+            sampler = MinPerClassSampler(train_labels, batch_size=batch_size, min_per_class=min_per_class)
+            train_loader = DataLoader(train_eval_ds, batch_size=batch_size, shuffle=True)
+        else:
+            train_loader = DataLoader(train_contrastive, batch_size=batch_size, shuffle=True)
         memory_loader = DataLoader(train_eval_ds, batch_size=batch_size, shuffle=False)
         val_loader = DataLoader(val_ds, batch_size=batch_size, shuffle=False)
         test_loader = DataLoader(test_ds, batch_size=batch_size, shuffle=False)
@@ -170,11 +217,12 @@ def get_cifar10_supcon_loaders(
     ])
 
     # Three handles to training data: contrastive aug, eval transforms (x2)
+    train_transform = contrastive_transform if no_aug else TwoCropTransform(contrastive_transform)
     train_contrastive_full = torchvision.datasets.CIFAR10(
         root=data_root,
         train=True,
         download=True,
-        transform=TwoCropTransform(contrastive_transform),
+        transform=train_transform,
     )
     train_eval_full = torchvision.datasets.CIFAR10(
         root=data_root,
@@ -204,15 +252,28 @@ def get_cifar10_supcon_loaders(
     train_memory_dataset = Subset(train_eval_full, train_indices)
     # Val uses disjoint indices, eval transforms
     val_dataset = Subset(train_eval_full, val_indices)
-
-    train_loader = DataLoader(
-        train_contrastive_dataset,
-        batch_size=batch_size,
-        shuffle=True,
-        num_workers=num_workers,
-        pin_memory=True,
-        drop_last=True,
-    )
+    if no_aug:
+        sampler = MinPerClassSampler(
+            labels=torch.tensor(train_contrastive_dataset.dataset.targets
+                                )[train_contrastive_dataset.indices],
+            batch_size=batch_size,
+            min_per_class=min_per_class,
+        )
+        train_loader = DataLoader(
+            train_contrastive_dataset,
+            num_workers=num_workers,
+            pin_memory=True,
+            batch_sampler=sampler,
+        )
+    else:
+        train_loader = DataLoader(
+            train_contrastive_dataset,
+            batch_size=batch_size,
+            shuffle=True,
+            num_workers=num_workers,
+            pin_memory=True,
+            drop_last=True,
+        )
     memory_loader = DataLoader(
         train_memory_dataset,
         batch_size=batch_size,

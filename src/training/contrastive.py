@@ -48,6 +48,43 @@ class SupConLoss(torch.nn.Module):
             raise RuntimeError("SupCon loss became non-finite")
         return loss
 
+class NoAugSupConLoss(torch.nn.Module):
+    """Supervised contrastive loss from https://arxiv.org/abs/2004.11362."""
+
+    def __init__(self, temperature: float = 0.07):
+        super().__init__()
+        self.temperature = temperature
+
+    def forward(self, features: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
+        if features.ndim != 2:
+            raise ValueError(f"Expected features with shape [batch, dim], got {features.shape}")
+
+        device = features.device
+        features = F.normalize(features, dim=1)
+
+        logits = features @ features.T
+        logits = logits / self.temperature
+        logits = logits - logits.max(dim=1, keepdim=True).values.detach()
+
+        labels = labels.contiguous().view(-1, 1)
+        mask = torch.eq(labels, labels.T).float().to(device)
+
+        logits_mask = torch.ones_like(mask)
+        logits_mask.fill_diagonal_(0.0)
+        mask = mask * logits_mask
+
+        exp_logits = torch.exp(logits) * logits_mask
+        log_prob = logits - torch.log(exp_logits.sum(dim=1, keepdim=True) + 1e-12)
+
+        positives_per_anchor = mask.sum(dim=1)
+        valid = positives_per_anchor > 0
+        mean_log_prob_pos = torch.zeros_like(positives_per_anchor)
+        mean_log_prob_pos[valid] = (mask[valid] * log_prob[valid]).sum(dim=1) / positives_per_anchor[valid]
+
+        loss = -mean_log_prob_pos[valid].mean()
+        if not torch.isfinite(loss):
+            raise RuntimeError("SupCon loss became non-finite")
+        return loss
 
 def train_supcon(
     model: torch.nn.Module,

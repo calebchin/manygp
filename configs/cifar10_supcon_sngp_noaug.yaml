@@ -1,0 +1,47 @@
+experiment:
+  name: cifar10_supcon_sngp
+  smoke_test: false
+
+data:
+  root: ../datafolder/data
+  batch_size: 256
+  num_workers: 2
+  no_aug: true
+  min_per_class: 2
+
+model:
+  width: 64
+  embedding_dim: 128
+  num_classes: 10
+  hidden_dims: []
+  dropout_rate: 0.1
+  kernel_type: normalized_rbf
+  input_normalization: l2
+  kernel_scale: 1.0
+  length_scale: 1.0
+  num_inducing: 1024
+  ridge_penalty: 1.0
+  feature_scale: 2.0
+  gp_cov_momentum: -1.0
+  normalize_input: false
+
+training:
+  epochs: 100
+  eval_interval: 1
+  log_every_steps: 20
+  lr: 0.001
+  weight_decay: 0.0001
+  supcon_temperature: 0.07
+  supcon_loss_weight: 1.0
+  ce_loss_weight: 1.0
+  num_mc_samples: 10
+
+output:
+  checkpoint_path: ./checkpoints_supcon_sngp/cifar10_supcon_sngp.pt
+  top_k: 5
+
+wandb:
+  enabled: true
+  project: supcon_noaug
+  entity: sta414manygp
+  run_name: test
