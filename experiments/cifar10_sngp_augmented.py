@@ -1,20 +1,25 @@
 """
-CIFAR-10 joint supervised contrastive + SNGP classification training.
+CIFAR-10 SNGP with SupCon-style strong data augmentation (CE loss only).
+
+This is experiment 3: same SNGP architecture (spectrally normalized WRN-28-10 +
+GP head) as experiment 1, but trained with the two-view strong augmentation
+pipeline from SupCon (experiment 2). No contrastive loss is used — only CE.
+
+Both augmented views of each image are fed through the model and CE loss is
+computed over all views, effectively doubling the training signal with diverse
+augmentations per step.
 
 After training, runs OOD detection (SVHN, CIFAR-100) and CIFAR-10-C corruption
 robustness evaluation in the same W&B run.
 
 Usage:
-    python experiments/cifar10_supcon_sngp.py --config configs/cifar10_supcon_sngp.yaml
+    python experiments/cifar10_sngp_augmented.py \\
+        --config configs/experiment_april2_sngp_augmented.yaml
 """
 
-from __future__ import annotations
-
 import argparse
-import copy
 import os
 import sys
-from datetime import datetime
 from pathlib import Path
 
 import torch
@@ -24,19 +29,11 @@ from tqdm.auto import tqdm
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from src.data.cifar10 import get_cifar10_supcon_loaders
-from src.models.sngp import laplace_predictive_probs
-from src.models.supcon_sngp import CifarResNetSupConSNGPClassifier
-from src.training.contrastive import SupConLoss
+from src.models.sngp import SNGPResNetClassifier, laplace_predictive_probs
 from src.training.evaluate import _classification_ece
 from src.training.ood_evaluate import collect_logits_and_probs
 from src.utils.model_loader import ModelWrapper
 from src.utils.model_summary import print_model_summary
-
-
-def resolve_timestamped_checkpoint_path(checkpoint_path: str) -> str:
-    checkpoint_target = Path(checkpoint_path)
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    return str(checkpoint_target.parent / timestamp / checkpoint_target.name)
 
 
 def update_topk_checkpoints(
@@ -87,75 +84,55 @@ def train_epoch(
     model: torch.nn.Module,
     loader,
     optimizer: torch.optim.Optimizer,
-    supcon_loss_fn: torch.nn.Module,
-    ce_loss_fn: torch.nn.Module,
+    loss_fn: torch.nn.Module,
     device: torch.device,
     epoch: int,
-    supcon_weight: float,
-    ce_weight: float,
     show_progress: bool = True,
     run=None,
     log_every_steps: int | None = None,
     global_step: int = 0,
-) -> tuple[dict[str, float], int]:
+) -> tuple[float, float, int]:
+    """Train one epoch with two-view augmented batches using CE loss only."""
     model.train()
     # NOTE: precision matrix reset is done once before the training loop starts.
-    running_total_loss = 0.0
-    running_supcon_loss = 0.0
-    running_ce_loss = 0.0
+    running_loss = 0.0
     total_correct = 0
     total_examples = 0
 
-    progress = tqdm(loader, desc=f"SupCon SNGP Epoch {epoch}", leave=False, disable=not show_progress)
+    progress = tqdm(loader, desc=f"SNGP-Aug Epoch {epoch}", leave=False, disable=not show_progress)
     for views, labels in progress:
         labels = labels.to(device, non_blocking=True)
         batch_size, num_views, channels, height, width = views.shape
+        # Flatten both views into the batch dimension
         views = views.to(device, non_blocking=True).view(batch_size * num_views, channels, height, width)
         ce_labels = labels.repeat_interleave(num_views)
 
         optimizer.zero_grad(set_to_none=True)
-        logits, gp_inputs = model(views, update_precision=True, return_features=True)
-        gp_inputs = gp_inputs.view(batch_size, num_views, -1)
-
-        supcon_loss = supcon_loss_fn(gp_inputs, labels)
-        ce_loss = ce_loss_fn(logits, ce_labels)
-        total_loss = supcon_weight * supcon_loss + ce_weight * ce_loss
-        total_loss.backward()
+        logits = model(views, update_precision=True)
+        loss = loss_fn(logits, ce_labels)
+        loss.backward()
         optimizer.step()
 
         global_step += 1
-        running_total_loss += total_loss.item()
-        running_supcon_loss += supcon_loss.item()
-        running_ce_loss += ce_loss.item()
+        running_loss += loss.item()
         total_correct += (logits.argmax(dim=1) == ce_labels).sum().item()
         total_examples += ce_labels.size(0)
-        progress.set_postfix(
-            total=f"{total_loss.item():.4f}",
-            supcon=f"{supcon_loss.item():.4f}",
-            ce=f"{ce_loss.item():.4f}",
-        )
+        progress.set_postfix(loss=f"{loss.item():.4f}")
 
         if run is not None and log_every_steps is not None and log_every_steps > 0:
             if global_step % log_every_steps == 0:
                 run.log({
-                    "train/step_total_loss":  total_loss.item(),
-                    "train/step_supcon_loss": supcon_loss.item(),
-                    "train/step_ce_loss":     ce_loss.item(),
-                    "train/global_step":      global_step,
-                    "train/epoch":            epoch,
-                    "train/lr_step":          optimizer.param_groups[0]["lr"],
+                    "train/step_loss":   loss.item(),
+                    "train/global_step": global_step,
+                    "train/epoch":       epoch,
+                    "train/lr_step":     optimizer.param_groups[0]["lr"],
                 })
 
-    return {
-        "total_loss":  running_total_loss / len(loader),
-        "supcon_loss": running_supcon_loss / len(loader),
-        "ce_loss":     running_ce_loss / len(loader),
-        "accuracy":    total_correct / total_examples,
-    }, global_step
+    return running_loss / len(loader), total_correct / total_examples, global_step
 
 
 @torch.no_grad()
-def evaluate_joint_sngp(
+def evaluate_sngp(
     model: torch.nn.Module,
     loader,
     device: torch.device,
@@ -172,7 +149,6 @@ def evaluate_joint_sngp(
     for images, labels in loader:
         images = images.to(device, non_blocking=True)
         labels = labels.to(device, non_blocking=True)
-
         logits, variances = model(images, return_cov=True)
         probs = laplace_predictive_probs(logits, variances, num_mc_samples=num_mc_samples)
         log_probs = probs.clamp_min(1e-12).log()
@@ -225,6 +201,7 @@ def main(cfg: dict) -> None:
         )
 
     data_cfg = cfg["data"]
+    # Use the SupCon data pipeline for strong two-view augmentation
     train_loader, _, val_loader, test_loader, train_dataset, val_dataset, test_dataset = get_cifar10_supcon_loaders(
         data_root=data_cfg["root"],
         batch_size=data_cfg["batch_size"],
@@ -234,21 +211,16 @@ def main(cfg: dict) -> None:
     print(f"Train: {len(train_dataset)}  Val: {len(val_dataset)}  Test: {len(test_dataset)}")
 
     model_cfg = cfg["model"]
-    model = CifarResNetSupConSNGPClassifier(
-        embedding_dim=model_cfg["embedding_dim"],
+    model = SNGPResNetClassifier(
         num_classes=model_cfg["num_classes"],
         widen_factor=model_cfg.get("widen_factor", 10),
-        hidden_dims=model_cfg["hidden_dims"],
-        dropout_rate=model_cfg["dropout_rate"],
+        hidden_dim=model_cfg["hidden_dim"],
+        spec_norm_bound=model_cfg["spec_norm_bound"],
         num_inducing=model_cfg["num_inducing"],
         ridge_penalty=model_cfg["ridge_penalty"],
         feature_scale=model_cfg["feature_scale"],
         gp_cov_momentum=model_cfg["gp_cov_momentum"],
         normalize_input=model_cfg["normalize_input"],
-        kernel_type=model_cfg["kernel_type"],
-        input_normalization=model_cfg["input_normalization"],
-        kernel_scale=model_cfg["kernel_scale"],
-        length_scale=model_cfg["length_scale"],
     ).to(device)
     print_model_summary(model)
 
@@ -262,20 +234,16 @@ def main(cfg: dict) -> None:
         optimizer,
         T_max=1 if smoke_test else train_cfg["epochs"],
     )
-    supcon_loss_fn = SupConLoss(temperature=train_cfg["supcon_temperature"])
-    ce_loss_fn = torch.nn.CrossEntropyLoss()
+    loss_fn = torch.nn.CrossEntropyLoss()
 
-    best_val_acc = -1.0
+    best_acc = -1.0
     num_epochs = 1 if smoke_test else train_cfg["epochs"]
     eval_interval = 1 if smoke_test else train_cfg.get("eval_interval", 1)
     log_every_steps = train_cfg.get("log_every_steps", None)
     num_mc_samples = train_cfg.get("num_mc_samples", 10)
-    supcon_weight = train_cfg.get("supcon_loss_weight", 1.0)
-    ce_weight = train_cfg.get("ce_loss_weight", 1.0)
     output_cfg = cfg.get("output", {})
     checkpoint_path = output_cfg.get("checkpoint_path")
-    resolved_checkpoint_path = resolve_timestamped_checkpoint_path(checkpoint_path) if checkpoint_path else None
-    top_k = output_cfg.get("top_k", 5)
+    top_k = output_cfg.get("top_k", 1)
     checkpoint_metric = output_cfg.get("checkpoint_metric", "val_ece")
     lower_is_better = checkpoint_metric in ("val_ece", "val_loss")
     saved_checkpoints: list[dict] = []
@@ -284,87 +252,70 @@ def main(cfg: dict) -> None:
     # Single precision-matrix reset before training begins (not per-epoch).
     model.reset_precision_matrix()
 
-    runtime_cfg = copy.deepcopy(cfg)
-    runtime_cfg.setdefault("output", {})["resolved_checkpoint_path"] = resolved_checkpoint_path
-
     epoch_progress = tqdm(range(1, num_epochs + 1), desc="Epoch", leave=True)
     for epoch in epoch_progress:
-        train_metrics, global_step = train_epoch(
-            model=model, loader=train_loader, optimizer=optimizer,
-            supcon_loss_fn=supcon_loss_fn, ce_loss_fn=ce_loss_fn, device=device,
-            epoch=epoch, supcon_weight=supcon_weight, ce_weight=ce_weight,
-            show_progress=True, run=run, log_every_steps=log_every_steps, global_step=global_step,
+        train_loss, train_acc, global_step = train_epoch(
+            model=model, loader=train_loader, optimizer=optimizer, loss_fn=loss_fn,
+            device=device, epoch=epoch, show_progress=True, run=run,
+            log_every_steps=log_every_steps, global_step=global_step,
         )
         scheduler.step()
 
         should_evaluate = epoch % eval_interval == 0 or epoch == num_epochs
-        val_metrics = None
+        val_loss = val_acc = val_nll = val_ece = None
         if should_evaluate:
-            val_metrics = evaluate_joint_sngp(model=model, loader=val_loader, device=device, num_mc_samples=num_mc_samples)
+            metrics = evaluate_sngp(model=model, loader=val_loader, device=device, num_mc_samples=num_mc_samples)
+            val_loss, val_acc, val_nll, val_ece = (
+                metrics["loss"], metrics["accuracy"], metrics["nll"], metrics["ece"]
+            )
             print(
                 f"Epoch {epoch:3d}/{num_epochs} | "
-                f"Train Total: {train_metrics['total_loss']:.4f} | "
-                f"Train SupCon: {train_metrics['supcon_loss']:.4f} | "
-                f"Train CE: {train_metrics['ce_loss']:.4f} | "
-                f"Train Acc: {train_metrics['accuracy'] * 100:.2f}% | "
-                f"Val Acc: {val_metrics['accuracy'] * 100:.2f}% | "
-                f"Val NLL: {val_metrics['nll']:.4f}"
+                f"Train Loss: {train_loss:.4f} | Train Acc: {train_acc * 100:.2f}% | "
+                f"Val Loss: {val_loss:.4f} | Val Acc: {val_acc * 100:.2f}% | "
+                f"Val NLL: {val_nll:.4f} | Val ECE: {val_ece:.4f}"
             )
             epoch_progress.set_postfix(
-                train_total=f"{train_metrics['total_loss']:.4f}",
-                train_acc=f"{train_metrics['accuracy'] * 100:.2f}%",
-                val_acc=f"{val_metrics['accuracy'] * 100:.2f}%",
+                train_loss=f"{train_loss:.4f}", train_acc=f"{train_acc * 100:.2f}%",
+                val_acc=f"{val_acc * 100:.2f}%",
             )
         else:
-            print(
-                f"Epoch {epoch:3d}/{num_epochs} | "
-                f"Train Total: {train_metrics['total_loss']:.4f} | "
-                f"Train Acc: {train_metrics['accuracy'] * 100:.2f}%"
-            )
-            epoch_progress.set_postfix(
-                train_total=f"{train_metrics['total_loss']:.4f}",
-                train_acc=f"{train_metrics['accuracy'] * 100:.2f}%",
-            )
+            print(f"Epoch {epoch:3d}/{num_epochs} | Train Loss: {train_loss:.4f} | Train Acc: {train_acc * 100:.2f}%")
+            epoch_progress.set_postfix(train_loss=f"{train_loss:.4f}", train_acc=f"{train_acc * 100:.2f}%")
 
         if run is not None:
             log_data = {
-                "train/total_loss":  train_metrics["total_loss"],
-                "train/supcon_loss": train_metrics["supcon_loss"],
-                "train/ce_loss":     train_metrics["ce_loss"],
-                "train/accuracy":    train_metrics["accuracy"],
-                "train/lr":          optimizer.param_groups[0]["lr"],
-                "train/epoch":       epoch,
+                "train/loss": train_loss, "train/accuracy": train_acc,
+                "train/lr": optimizer.param_groups[0]["lr"], "train/epoch": epoch,
             }
-            if val_metrics is not None:
-                log_data.update({"val/loss": val_metrics["loss"], "val/accuracy": val_metrics["accuracy"],
-                                 "val/nll": val_metrics["nll"], "val/ece": val_metrics["ece"]})
+            if val_loss is not None:
+                log_data.update({"val/loss": val_loss, "val/accuracy": val_acc,
+                                 "val/nll": val_nll, "val/ece": val_ece})
             run.log(log_data)
 
-        if val_metrics is None:
+        if val_acc is None:
             continue
 
-        if val_metrics["accuracy"] > best_val_acc:
-            best_val_acc = val_metrics["accuracy"]
+        if val_acc > best_acc:
+            best_acc = val_acc
         checkpoint_state = {
             "epoch": epoch,
             "model_state_dict": model.state_dict(),
             "optimizer_state_dict": optimizer.state_dict(),
-            "train_metrics": train_metrics,
-            "val_metrics": val_metrics,
-            "config": runtime_cfg,
+            "val_accuracy": val_acc, "val_loss": val_loss, "val_nll": val_nll, "val_ece": val_ece,
+            "config": cfg,
         }
-        if resolved_checkpoint_path:
-            _metric_map = {"val_ece": val_metrics["ece"], "val_loss": val_metrics["loss"], "val_accuracy": val_metrics["accuracy"]}
-            _ckpt_val = _metric_map.get(checkpoint_metric, val_metrics["ece"])
+        if checkpoint_path:
+            _metric_map = {"val_ece": val_ece, "val_loss": val_loss, "val_accuracy": val_acc}
+            _ckpt_val = _metric_map.get(checkpoint_metric, val_ece)
             update_topk_checkpoints(
                 saved_checkpoints=saved_checkpoints, top_k=top_k,
-                checkpoint_path=resolved_checkpoint_path, state=checkpoint_state,
+                checkpoint_path=checkpoint_path, state=checkpoint_state,
                 metric_name=checkpoint_metric.replace("val_", ""), metric_value=_ckpt_val, epoch=epoch,
                 lower_is_better=lower_is_better,
             )
 
-    if best_val_acc >= 0.0:
-        print(f"Best validation accuracy: {best_val_acc * 100:.2f}%")
+    if best_acc >= 0.0:
+        print(f"Best validation accuracy: {best_acc * 100:.2f}%")
 
     # ── Test evaluation + OOD/CIFAR-C (same W&B run) ─────────────────────────
     test_metrics: dict[str, float] | None = None
@@ -377,7 +328,7 @@ def main(cfg: dict) -> None:
         print(f"Best model saved to: {best_model_path}")
 
         print("\nEvaluating best checkpoint on held-out test set...")
-        test_metrics = evaluate_joint_sngp(model, test_loader, device, num_mc_samples)
+        test_metrics = evaluate_sngp(model, test_loader, device, num_mc_samples)
         print(
             f"Test Acc: {test_metrics['accuracy'] * 100:.2f}% | "
             f"Test NLL: {test_metrics['nll']:.4f} | "
@@ -395,27 +346,27 @@ def main(cfg: dict) -> None:
         if not smoke_test and cfg.get("ood", {}).get("enabled", True):
             print("\nRunning OOD + CIFAR-C evaluation...")
             from src.training.post_training_eval import run_full_ood_eval
-            wrapper = ModelWrapper(model=model, has_cov=True, num_mc_samples=num_mc_samples, model_type="supcon_sngp")
+            wrapper = ModelWrapper(model=model, has_cov=True, num_mc_samples=num_mc_samples, model_type="sngp_augmented")
             id_logits, id_probs, _, _ = collect_logits_and_probs(wrapper, test_loader, device, num_mc_samples)
             run_full_ood_eval(
                 model=model, has_cov=True, id_logits=id_logits, id_probs=id_probs,
-                cfg=cfg, device=device, run=run, num_mc_samples=num_mc_samples, model_type="supcon_sngp",
+                cfg=cfg, device=device, run=run, num_mc_samples=num_mc_samples, model_type="sngp_augmented",
             )
 
     if run is not None:
-        if best_val_acc >= 0.0:
-            run.log({"best/val_accuracy": best_val_acc})
+        if best_acc >= 0.0:
+            run.log({"best/val_accuracy": best_acc})
         if saved_checkpoints:
             run.log({f"best/{checkpoint_metric}": saved_checkpoints[0]["metric"]})
             import wandb
-            artifact = wandb.Artifact("cifar10_supcon_sngp_best_model", type="model")
+            artifact = wandb.Artifact("cifar10_sngp_augmented_best_model", type="model")
             artifact.add_file(str(saved_checkpoints[0]["path"]), name=saved_checkpoints[0]["path"].name)
             run.log_artifact(artifact)
         run.finish()
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="CIFAR-10 joint SupCon + SNGP training")
+    parser = argparse.ArgumentParser(description="CIFAR-10 SNGP + SupCon augmentation (CE only)")
     parser.add_argument("--config", required=True, help="Path to YAML config file")
     parser.add_argument("--seed", type=int, default=None, help="Random seed (overrides config)")
     parser.add_argument("--run-name", type=str, default=None, dest="run_name",

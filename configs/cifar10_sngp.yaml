@@ -9,7 +9,7 @@ data:
 
 model:
   num_classes: 10
-  width: 64
+  widen_factor: 10
   hidden_dim: 128
   spec_norm_bound: 0.95
   num_inducing: 1024

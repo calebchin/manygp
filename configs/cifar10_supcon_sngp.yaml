@@ -8,7 +8,7 @@ data:
   num_workers: 2
 
 model:
-  width: 64
+  widen_factor: 10
   embedding_dim: 128
   num_classes: 10
   hidden_dims: []
