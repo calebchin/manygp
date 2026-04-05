@@ -24,7 +24,7 @@ model:
   normalize_input: false
 
 training:
-  epochs: 100
+  epochs: 200
   eval_interval: 1
   log_every_steps: 20
   lr: 0.001

@@ -3,6 +3,7 @@ CIFAR-10 joint supervised contrastive + SNGP classification training.
 
 Usage:
     python experiments/cifar10_supcon_sngp.py --config configs/cifar10_supcon_sngp.yaml
+    python experiments/cifar10_supcon_sngp.py --config configs/cifar10_supcon_sngp.yaml --supcon-loss-weight 0.5
 """
 
 from __future__ import annotations
@@ -13,6 +14,7 @@ import os
 import sys
 from datetime import datetime
 from pathlib import Path
+from uuid import uuid4
 
 import torch
 import yaml
@@ -30,7 +32,8 @@ from src.utils.model_summary import print_model_summary
 def resolve_timestamped_checkpoint_path(checkpoint_path: str) -> str:
     checkpoint_target = Path(checkpoint_path)
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    return str(checkpoint_target.parent / timestamp / checkpoint_target.name)
+    random_suffix = uuid4().hex[:8]
+    return str(checkpoint_target.parent / f"{timestamp}_{random_suffix}" / checkpoint_target.name)
 
 
 def update_topk_checkpoints(
@@ -377,9 +380,18 @@ def main(cfg: dict) -> None:
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="CIFAR-10 joint SupCon + SNGP training")
     parser.add_argument("--config", required=True, help="Path to YAML config file")
+    parser.add_argument(
+        "--supcon-loss-weight",
+        type=float,
+        default=None,
+        help="Optional override for training.supcon_loss_weight",
+    )
     args = parser.parse_args()
 
     with open(args.config) as f:
         cfg = yaml.safe_load(f)
+
+    if args.supcon_loss_weight is not None:
+        cfg.setdefault("training", {})["supcon_loss_weight"] = args.supcon_loss_weight
 
     main(cfg)
