@@ -10,20 +10,19 @@ data:
 cnn:
   latent_dim: 64
   num_classes: 10
-  pretrain_epochs: 20
-  pretrain_lr: 0.01
-  pretrain_milestones: [10, 15]
+  spectral_conv: true
+  spectral_bn: true
 
 dkl:
   inducing_pool_size: 5000
   num_inducing_pts: 128
-  num_output: 64
-  per_feature: true
+  num_output: 10
+  per_feature: false
 
 training:
-  num_epochs: 100
+  num_epochs: 200
   initial_lr: 0.1
-  milestones: [20, 40]
+  milestones: [60, 120, 160]
   beta_reg: 0.05
 
 wandb:
