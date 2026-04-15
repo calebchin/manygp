@@ -20,7 +20,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from src.data.cifar10 import get_cifar10_loaders
 from src.models.due.wide_resnet import WideResNet
 from src.models.feature_extractors import CNNFeatureExtractor
-from src.models.dkl import GP, DKLModel
+from src.models.dkl import GP, DKLModel, initial_values
 from src.training.trainer import (
     extract_cnn_features,
     init_inducing_points_kmeans,
@@ -28,6 +28,77 @@ from src.training.trainer import (
 )
 from src.training.evaluate import evaluate_classifier
 
+def train_dkl(
+    model,
+    objective,
+    train_loader,
+    num_epochs: int,
+    lr: float,
+    milestones: List[int],
+    device,
+    run=None,
+) -> List[float]:
+    """
+    Train a DSPP model with Adam + MultiStepLR.
+
+    Fixes the tqdm.notebook crash from the original dspp.ipynb by using
+    tqdm.auto instead.
+
+    Args:
+        model:        DSPP model (TwoLayerDSPPClassifier or TwoLayerDSPP).
+        objective:    gpytorch Likelihood instance.
+        train_loader: DataLoader yielding (x_batch, y_batch).
+        num_epochs:   Number of training epochs.
+        lr:           Initial learning rate.
+        milestones:   Epoch milestones for MultiStepLR (gamma=0.1).
+        device:       torch.device
+        cnn:          Optional feature extractor (CIFAR-10 only).
+                      If provided, kept in eval mode; features are extracted in-loop.
+        run:          Optional W&B run object. If provided, logs per-epoch metrics.
+
+    Returns:
+        List of per-epoch average losses.
+    """
+    optimizer = torch.optim.Adam([
+        {'params': model.feature_extractor.parameters(), 'weight_decay': 5e-4},
+        {'params': model.gp_layer.hyperparameters(), 'lr': lr * 0.01},
+        {'params': model.gp_layer.variational_parameters()},
+        {'params': objective.parameters()},
+    ], lr=lr, betas=(0.9, 0.999))
+    scheduler = torch.optim.lr_scheduler.MultiStepLR(optimizer, milestones=milestones, gamma=0.2)
+    mll = VariationalELBO(objective, model.gp_layer, num_data=len(train_loader.dataset))
+
+    epoch_losses = []
+    epochs_iter = tqdm(range(num_epochs), desc="Epoch")
+    for epoch in epochs_iter:
+        model.train()
+        objective.train()
+        total_loss = 0.0
+
+        for x_batch, y_batch in tqdm(train_loader, desc="Minibatch", leave=False):
+            x_batch, y_batch = x_batch.to(device), y_batch.to(device)
+            optimizer.zero_grad()
+            output = model(x_batch)
+            loss = -mll(output, y_batch)
+            loss.backward()
+            optimizer.step()
+            total_loss += loss.item()
+
+        scheduler.step()
+        avg_loss = total_loss / len(train_loader)
+        epoch_losses.append(avg_loss)
+        epochs_iter.set_postfix(loss=avg_loss)
+
+        print(f"Epoch {epoch + 1:3d}/{num_epochs} | Loss: {avg_loss:.4f}")
+
+        if run is not None:
+            run.log({
+                "train/loss": avg_loss,
+                "train/epoch": epoch + 1,
+                "train/lr": scheduler.get_last_lr()[0],
+            })
+
+    return epoch_losses
 
 
 def main(cfg: dict, config_path: str) -> None:
@@ -73,25 +144,28 @@ def main(cfg: dict, config_path: str) -> None:
 
     # ── Inducing point initialisation ─────────────────────────────────────────
     dkl_cfg = cfg["dkl"]
-    pool = extract_cnn_features(
-        cnn=cnn,
-        loader=train_loader,
-        n_samples=dkl_cfg["inducing_pool_size"],
-        device=device,
+    # pool = extract_cnn_features(
+    #     cnn=cnn,
+    #     loader=train_loader,
+    #     n_samples=dkl_cfg["inducing_pool_size"],
+    #     device=device,
+    # )
+    # inducing = init_inducing_points_kmeans(pool, dkl_cfg["num_inducing_pts"]).to(device)
+    initial_inducing_points, initial_lengthscale = initial_values(
+        dataset_train, cnn, dkl_cfg["num_inducing_pts"]
     )
-    inducing = init_inducing_points_kmeans(pool, dkl_cfg["num_inducing_pts"]).to(device)
-    print(f"Inducing points shape: {inducing.shape}")
+    print(f"Inducing points shape: {initial_inducing_points.shape}")
 
     # ── DKL model ────────────────────────────────────────────────────────────
     dp_num_output = inducing.shape[1] if dkl_cfg["per_feature"] else dkl_cfg["num_output"]
     gp = GP(
-        inducing_points=inducing,
-        num_inducing=dkl_cfg["num_inducing_pts"],
-        num_output=dp_num_output,
-        per_feature=dkl_cfg["per_feature"]
+        num_outputs=dp_num_output,
+        initial_lengthscale=initial_lengthscale,
+        initial_inducing_points=initial_inducing_points,
+        kernel=dkl_cfg.get("kernel", "RBF"),
     ).to(device)
     
-    objective = SoftmaxLikelihood(num_features=dp_num_output, num_classes=cnn_cfg["num_classes"]).to(device)
+    objective = SoftmaxLikelihood(num_classes=cnn_cfg["num_classes"], mixing_weights=False).to(device)
     dkl = DKLModel(cnn, gp, objective, per_feature=dkl_cfg["per_feature"]).to(device)
 
     train_cfg = cfg["training"]
