@@ -55,7 +55,6 @@ def train_dkl(
 
             optimizer.zero_grad()
 
-            # IMPORTANT: model outputs GP distribution (NOT softmax)
             output = model(x_batch)
 
             loss = -mll(output, y_batch)
@@ -80,7 +79,7 @@ def train_dkl(
                 "train/loss": avg_loss,
                 "train/epoch": epoch + 1,
                 "train/lr": scheduler.get_last_lr()[0],
-                "eval/acc": metric["acc"],
+                "eval/accuracy": metric["accuracy"],
                 "eval/nll": metric["nll"],
             })
 
@@ -156,7 +155,6 @@ def main(cfg: dict, config_path: str) -> None:
 
     dkl_cfg = cfg["dkl"]
 
-    # ? Correct inducing initialization
     initial_inducing_points, initial_lengthscale = initial_values(
         dataset_train, cnn, dkl_cfg["num_inducing_pts"]
     )
@@ -170,16 +168,13 @@ def main(cfg: dict, config_path: str) -> None:
         kernel=dkl_cfg.get("kernel", "RBF"),
     ).to(device)
 
-    # likelihood (kept separate, like original)
     objective = SoftmaxLikelihood(
         num_classes=cnn_cfg["num_classes"],
         mixing_weights=False
     ).to(device)
 
-    # ?? IMPORTANT: control MC samples
     objective.num_samples = 5
 
-    # model = feature extractor + GP ONLY
     dkl = DKLModel(cnn, gp, objective).to(device)
 
     train_cfg = cfg["training"]
@@ -195,6 +190,7 @@ def main(cfg: dict, config_path: str) -> None:
         lr=train_cfg["initial_lr"],
         milestones=train_cfg["milestones"],
         device=device,
+        run=run
     )
 
     metrics = evaluate_dkl(dkl, objective, test_loader, device)
