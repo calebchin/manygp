@@ -2,73 +2,86 @@
 #
 # Orchestration script for april_4_experiments.
 #
-# Submits all 15 training jobs: 5 seeds × 3 experiments (SNGP, SupCon+SNGP, SNGP+Aug).
-# After each training job a snapshot summary is printed (afterany dependency).
-# After all 15 jobs finish, submits 5 deterministic (Deep Ensemble member) jobs.
-# After all 5 deterministic jobs finish, submits the Deep Ensemble eval job.
-# A final summary runs after the ensemble eval.
+# Submits all training jobs across 4 experiment types × 5 seeds:
+#   1. SNGP          (WRN-28-10 + spectral norm + GP, CE, RFF=1024)
+#   2. SupCon+SNGP   (WRN-28-10, SupCon aug + GP, SupCon+CE)
+#   3. SNGP+Aug      (WRN-28-10 + spectral norm + GP, CE, strong aug, RFF=1024)
+#   4. SNGP+Aug RFF  (same as 3 but RFF=NUM_INDUCING, default 4096)
 #
-# Usage (from the repo root):
+# After every individual seed job (success OR failure), a W&B results table
+# is rebuilt and uploaded so it fills up incrementally.
+#
+# After all 20 jobs finish, submits 5 deterministic (Deep Ensemble member) jobs.
+# After all 5 deterministic jobs finish, submits the Deep Ensemble eval job,
+# followed by a final table rebuild.
+#
+# All training jobs use retry_lib.sh — up to 3 attempts per seed, with
+# automatic W&B run cleanup between retries.
+#
+# Usage (from repo root):
 #   bash slurm_scripts/run_april2_all.sh
 #
-# To run only specific seeds, set SEEDS before calling:
-#   SEEDS="0 1" bash slurm_scripts/run_april2_all.sh
+# Override seeds or RFF count:
+#   SEEDS="0 1" NUM_INDUCING=8192 bash slurm_scripts/run_april2_all.sh
 
 set -euo pipefail
 
 REPO=/w/20252/davida/manygp/manygp
 SCRIPTS="$REPO/slurm_scripts"
 SEEDS="${SEEDS:-0 1 2 3 4}"
+NUM_INDUCING="${NUM_INDUCING:-4096}"   # RFF count for experiment 4
 
 echo "============================================"
 echo "  april_4_experiments — launching all jobs"
 echo "  Seeds: ${SEEDS}"
+echo "  RFF experiment num_inducing: ${NUM_INDUCING}"
 echo "============================================"
 
 ALL_TRAIN_JIDS=()
 
+# Helper: submit a table-rebuild job after a given JID (afterany = runs even if failed)
+submit_table_after() {
+    local PARENT_JID=$1
+    sbatch --parsable \
+        --dependency="afterany:${PARENT_JID}" \
+        --job-name="apr4_table_snap" \
+        "$SCRIPTS/submit_april4_table.sh" > /dev/null
+}
+
 for SEED in $SEEDS; do
-    # ── Experiment 1: SNGP ──────────────────────────────────────────────────
+    # ── Exp 1: SNGP ────────────────────────────────────────────────────────
     JID=$(sbatch --parsable "$SCRIPTS/submit_april2_sngp.sh" \
         "$SEED" "sngp_seed${SEED}")
-    echo "  [seed ${SEED}] SNGP              → job ${JID}"
+    echo "  [seed ${SEED}] SNGP                  → job ${JID}"
     ALL_TRAIN_JIDS+=("$JID")
+    submit_table_after "$JID"
 
-    # Snapshot summary after this job (runs whether job succeeded or failed)
-    sbatch --parsable \
-        --dependency="afterany:${JID}" \
-        --job-name="apr4_summary_snap" \
-        "$SCRIPTS/submit_april2_summary.sh" > /dev/null
-
-    # ── Experiment 2: SupCon+SNGP ───────────────────────────────────────────
+    # ── Exp 2: SupCon+SNGP ─────────────────────────────────────────────────
     JID=$(sbatch --parsable "$SCRIPTS/submit_april2_supcon_sngp.sh" \
         "$SEED" "supcon_sngp_seed${SEED}")
-    echo "  [seed ${SEED}] SupCon+SNGP       → job ${JID}"
+    echo "  [seed ${SEED}] SupCon+SNGP            → job ${JID}"
     ALL_TRAIN_JIDS+=("$JID")
+    submit_table_after "$JID"
 
-    sbatch --parsable \
-        --dependency="afterany:${JID}" \
-        --job-name="apr4_summary_snap" \
-        "$SCRIPTS/submit_april2_summary.sh" > /dev/null
-
-    # ── Experiment 3: SNGP+Aug ──────────────────────────────────────────────
+    # ── Exp 3: SNGP+Aug (RFF=1024) ─────────────────────────────────────────
     JID=$(sbatch --parsable "$SCRIPTS/submit_april2_sngp_augmented.sh" \
         "$SEED" "sngp_aug_seed${SEED}")
-    echo "  [seed ${SEED}] SNGP+Aug          → job ${JID}"
+    echo "  [seed ${SEED}] SNGP+Aug               → job ${JID}"
     ALL_TRAIN_JIDS+=("$JID")
+    submit_table_after "$JID"
 
-    sbatch --parsable \
-        --dependency="afterany:${JID}" \
-        --job-name="apr4_summary_snap" \
-        "$SCRIPTS/submit_april2_summary.sh" > /dev/null
+    # ── Exp 4: SNGP+Aug RFF (RFF=NUM_INDUCING) ─────────────────────────────
+    JID=$(sbatch --parsable "$SCRIPTS/submit_april4_sngp_aug_rff.sh" \
+        "$SEED" "sngp_aug_rff${NUM_INDUCING}_seed${SEED}" "$NUM_INDUCING")
+    echo "  [seed ${SEED}] SNGP+Aug RFF${NUM_INDUCING}        → job ${JID}"
+    ALL_TRAIN_JIDS+=("$JID")
+    submit_table_after "$JID"
 done
 
 echo ""
-echo "  Submitted ${#ALL_TRAIN_JIDS[@]} training jobs + snapshot summary after each."
+echo "  Submitted ${#ALL_TRAIN_JIDS[@]} training jobs + table rebuild after each."
 
-# ── Deep Ensemble: 5 deterministic members (after all 15 training jobs) ──────
-#    Uses afterany so they start even if some SNGP jobs fail, since they are
-#    independent. Change to afterok if you want strict ordering.
+# ── Deep Ensemble: 5 deterministic members (after all 20 training jobs) ───────
 DEP_ALL=$(IFS=:; echo "${ALL_TRAIN_JIDS[*]}")
 
 echo ""
@@ -79,39 +92,32 @@ for SEED in $SEEDS; do
         --dependency="afterok:${DEP_ALL}" \
         "$SCRIPTS/submit_april4_deterministic.sh" \
         "$SEED" "deterministic_seed${SEED}")
-    echo "  [seed ${SEED}] Deterministic      → job ${JID}  (dep: afterok all 15)"
+    echo "  [seed ${SEED}] Deterministic          → job ${JID}  (dep: afterok all ${#ALL_TRAIN_JIDS[@]})"
     DET_JIDS+=("$JID")
-
-    # Snapshot summary after each deterministic job too
-    sbatch --parsable \
-        --dependency="afterany:${JID}" \
-        --job-name="apr4_summary_snap" \
-        "$SCRIPTS/submit_april2_summary.sh" > /dev/null
+    submit_table_after "$JID"
 done
 
-# ── Deep Ensemble evaluation (after all 5 deterministic jobs succeed) ─────────
+# ── Deep Ensemble evaluation ───────────────────────────────────────────────────
 DEP_DET=$(IFS=:; echo "${DET_JIDS[*]}")
 ENSEMBLE_JID=$(sbatch --parsable \
     --dependency="afterok:${DEP_DET}" \
     "$SCRIPTS/submit_april4_deep_ensemble_eval.sh")
 echo ""
-echo "  Deep Ensemble eval → job ${ENSEMBLE_JID}  (dep: afterok all 5 det. jobs)"
+echo "  Deep Ensemble eval         → job ${ENSEMBLE_JID}  (dep: afterok all 5 det. jobs)"
 
-# ── Final summary after ensemble eval ─────────────────────────────────────────
-FINAL_JID=$(sbatch --parsable \
-    --dependency="afterany:${ENSEMBLE_JID}" \
-    --job-name="apr4_summary_final" \
-    "$SCRIPTS/submit_april2_summary.sh")
-echo "  Final summary       → job ${FINAL_JID}  (dep: afterany ensemble eval)"
+    # Table already rebuilds after the ensemble eval via the afterany hook above
+    submit_table_after "$ENSEMBLE_JID"
 
 echo ""
 echo "============================================"
 echo "  W&B project: april_4_experiments (entity: sta414manygp)"
 echo "  Pipeline:"
-echo "    15 training jobs (SNGP × 3 exps × 5 seeds)"
-echo "    + snapshot summary after each training job"
+echo "    ${#ALL_TRAIN_JIDS[@]} training jobs (4 exps × 5 seeds, RFF=${NUM_INDUCING} for exp 4)"
+echo "    + W&B table rebuild after every seed"
 echo "    → 5 deterministic jobs (Deep Ensemble members)"
-echo "    + snapshot summary after each det. job"
 echo "    → Deep Ensemble eval (job ${ENSEMBLE_JID})"
-echo "    → Final summary (job ${FINAL_JID})"
+echo "    → Final table (job ${FINAL_TABLE_JID})"
+echo ""
+echo "  To change RFF count:  NUM_INDUCING=8192 bash slurm_scripts/run_april2_all.sh"
+echo "  To run fewer seeds:   SEEDS='0 1' bash slurm_scripts/run_april2_all.sh"
 echo "============================================"

@@ -19,9 +19,15 @@ import numpy as np
 
 
 EXPERIMENTS = [
-    ("SNGP",        "sngp_seed"),
-    ("SupCon+SNGP", "supcon_sngp_seed"),
-    ("SNGP+Aug",    "sngp_aug_seed"),
+    ("SNGP",             "sngp_seed"),
+    ("SupCon+SNGP",      "supcon_sngp_seed"),
+    ("SNGP+Aug",         "sngp_aug_seed"),
+    ("SNGP+Aug RFF4096", "sngp_aug_rff4096_seed"),
+    ("MS-SNGP",          "ms_sngp_seed"),
+    ("MS-SNGP+CNN",      "ms_sngp_cnn_seed"),
+    ("MS-SNGP+SN",       "ms_sngp_sn_seed"),
+    ("MS-SNGP NoSkip",   "ms_sngp_no_skip_seed"),
+    ("Hybrid SNGP",      "hybrid_sngp_seed"),
 ]
 
 # Single-run experiments (no seed averaging — just show the one value)

@@ -268,6 +268,10 @@ class SNGPResNetClassifier(nn.Module):
         feature_scale: float = 2.0,
         gp_cov_momentum: float = -1.0,
         normalize_input: bool = False,
+        kernel_type: str = "legacy",
+        input_normalization: str | None = None,
+        kernel_scale: float = 1.0,
+        length_scale: float = 1.0,
     ):
         super().__init__()
         self.backbone = WideResNet28SNGPBackbone(
@@ -283,6 +287,10 @@ class SNGPResNetClassifier(nn.Module):
             feature_scale=feature_scale,
             gp_cov_momentum=gp_cov_momentum,
             normalize_input=normalize_input,
+            kernel_type=kernel_type,
+            input_normalization=input_normalization,
+            kernel_scale=kernel_scale,
+            length_scale=length_scale,
         )
 
     def reset_precision_matrix(self) -> None:
@@ -296,6 +304,253 @@ class SNGPResNetClassifier(nn.Module):
         x: torch.Tensor,
         return_cov: bool = False,
         update_precision: bool = False,
+        return_features: bool = False,
     ):
         features = self.encode(x)
-        return self.classifier(features, return_cov=return_cov, update_precision=update_precision)
+        outputs = self.classifier(features, return_cov=return_cov, update_precision=update_precision)
+        if return_features:
+            return outputs, features
+        return outputs
+
+
+class VGGStyleSNGPBackbone(nn.Module):
+    """
+    VGG-style CNN backbone with spectral normalization for SNGP.
+
+    8 conv layers in 4 blocks (each followed by MaxPool), all spectrally
+    normalized to bound the Lipschitz constant without skip connections.
+    Simpler Lipschitz analysis than ResNet: no shortcut paths to worry about.
+
+    Architecture for 32x32 CIFAR inputs:
+      Block 1: Conv(3→64)×2   + MaxPool → 16×16
+      Block 2: Conv(64→128)×2 + MaxPool → 8×8
+      Block 3: Conv(128→256)×2 + MaxPool → 4×4
+      Block 4: Conv(256→512)   + AdaptiveAvgPool → 1×1
+      Projection: Linear(512 → embedding_dim)
+    """
+
+    def __init__(self, embedding_dim: int = 128, coeff: float = 0.95):
+        super().__init__()
+        c = coeff
+        self.features = nn.Sequential(
+            # Block 1: 32×32 → 16×16
+            SpectralConv2d(3,   64,  3, padding=1, coeff=c), nn.BatchNorm2d(64),  nn.ReLU(inplace=True),
+            SpectralConv2d(64,  64,  3, padding=1, coeff=c), nn.BatchNorm2d(64),  nn.ReLU(inplace=True),
+            nn.MaxPool2d(2, 2),
+            # Block 2: 16×16 → 8×8
+            SpectralConv2d(64,  128, 3, padding=1, coeff=c), nn.BatchNorm2d(128), nn.ReLU(inplace=True),
+            SpectralConv2d(128, 128, 3, padding=1, coeff=c), nn.BatchNorm2d(128), nn.ReLU(inplace=True),
+            nn.MaxPool2d(2, 2),
+            # Block 3: 8×8 → 4×4
+            SpectralConv2d(128, 256, 3, padding=1, coeff=c), nn.BatchNorm2d(256), nn.ReLU(inplace=True),
+            SpectralConv2d(256, 256, 3, padding=1, coeff=c), nn.BatchNorm2d(256), nn.ReLU(inplace=True),
+            nn.MaxPool2d(2, 2),
+            # Block 4: 4×4 → 1×1
+            SpectralConv2d(256, 512, 3, padding=1, coeff=c), nn.BatchNorm2d(512), nn.ReLU(inplace=True),
+            nn.AdaptiveAvgPool2d((1, 1)),
+        )
+        self.proj = SpectralLinear(512, embedding_dim, bias=True, coeff=coeff)
+        self.output_dim = embedding_dim
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = self.features(x)
+        x = torch.flatten(x, 1)
+        return self.proj(x)
+
+
+class CNNSupConSNGPClassifier(nn.Module):
+    """
+    VGG-style spectrally-normalized CNN backbone + RFGP head.
+
+    Drop-in replacement for CifarResNetSupConSNGPClassifier — same interface,
+    same forward() signature including return_features=True for MS/SupCon loss.
+    """
+
+    def __init__(
+        self,
+        embedding_dim: int = 128,
+        num_classes: int = 10,
+        spec_norm_bound: float = 0.95,
+        num_inducing: int = 1024,
+        ridge_penalty: float = 1e-3,
+        feature_scale: float = 2.0,
+        gp_cov_momentum: float = 0.999,
+        normalize_input: bool = False,
+        kernel_type: str = "normalized_rbf",
+        input_normalization: str = "l2",
+        kernel_scale: float = 1.0,
+        length_scale: float = 1.0,
+    ):
+        super().__init__()
+        self.backbone = VGGStyleSNGPBackbone(
+            embedding_dim=embedding_dim, coeff=spec_norm_bound
+        )
+        self.classifier = RandomFeatureGaussianProcess(
+            in_features=embedding_dim,
+            out_features=num_classes,
+            num_inducing=num_inducing,
+            ridge_penalty=ridge_penalty,
+            feature_scale=feature_scale,
+            gp_cov_momentum=gp_cov_momentum,
+            normalize_input=normalize_input,
+            kernel_type=kernel_type,
+            input_normalization=input_normalization,
+            kernel_scale=kernel_scale,
+            length_scale=length_scale,
+        )
+
+    def reset_precision_matrix(self) -> None:
+        self.classifier.reset_precision_matrix()
+
+    def encode(self, x: torch.Tensor) -> torch.Tensor:
+        return self.backbone(x)
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        return_cov: bool = False,
+        update_precision: bool = False,
+        return_features: bool = False,
+    ):
+        features = self.encode(x)
+        outputs = self.classifier(
+            features, return_cov=return_cov, update_precision=update_precision
+        )
+        if return_features:
+            return outputs, features
+        return outputs
+
+
+class WideResNetPreActBlockNoSkip(nn.Module):
+    """
+    Pre-activation WRN block with spectral normalization but NO residual skip.
+
+    Same conv structure as WideResNetPreActBlock, just removes the `+ shortcut(x)`
+    addition. This turns WRN-28-10 into a plain deep network with the same
+    depth, width, and Lipschitz constraint — isolating the effect of skip connections.
+    """
+
+    def __init__(self, in_channels: int, out_channels: int, stride: int = 1, coeff: float = 0.95):
+        super().__init__()
+        self.bn1 = nn.BatchNorm2d(in_channels)
+        self.conv1 = SpectralConv2d(
+            in_channels, out_channels, kernel_size=3, stride=stride, padding=1, bias=False, coeff=coeff
+        )
+        self.bn2 = nn.BatchNorm2d(out_channels)
+        self.conv2 = SpectralConv2d(
+            out_channels, out_channels, kernel_size=3, stride=1, padding=1, bias=False, coeff=coeff
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        out = self.conv1(F.relu(self.bn1(x), inplace=True))
+        out = self.conv2(F.relu(self.bn2(out), inplace=True))
+        return out  # no residual addition
+
+
+class WideResNet28NoSkipBackbone(nn.Module):
+    """
+    WRN-28-10 with spectral normalization but WITHOUT skip connections.
+
+    Identical channel structure and depth to WideResNet28SNGPBackbone:
+      channels [160, 320, 640], 4 blocks per group, 3 groups.
+    The only difference: residual additions are removed, making it a plain
+    28-layer deep network. Useful for ablating the role of skip connections
+    independently from depth, width, and spectral normalization.
+    """
+
+    _N_BLOCKS = 4
+    _BASE_CHANNELS = 16
+
+    def __init__(self, widen_factor: int = 10, hidden_dim: int = 128, coeff: float = 0.95):
+        super().__init__()
+        base = self._BASE_CHANNELS
+        w = [base * widen_factor, 2 * base * widen_factor, 4 * base * widen_factor]
+
+        self.stem = SpectralConv2d(3, base, kernel_size=3, stride=1, padding=1, bias=False, coeff=coeff)
+        self.group1 = self._make_group(base,    w[0], self._N_BLOCKS, stride=1, coeff=coeff)
+        self.group2 = self._make_group(w[0],    w[1], self._N_BLOCKS, stride=2, coeff=coeff)
+        self.group3 = self._make_group(w[1],    w[2], self._N_BLOCKS, stride=2, coeff=coeff)
+        self.bn_final = nn.BatchNorm2d(w[2])
+        self.pool = nn.AdaptiveAvgPool2d((1, 1))
+        self.proj = SpectralLinear(w[2], hidden_dim, bias=True, coeff=coeff)
+        self.output_dim = hidden_dim
+
+    def _make_group(self, in_ch, out_ch, n_blocks, stride, coeff):
+        blocks = [WideResNetPreActBlockNoSkip(in_ch, out_ch, stride=stride, coeff=coeff)]
+        for _ in range(1, n_blocks):
+            blocks.append(WideResNetPreActBlockNoSkip(out_ch, out_ch, stride=1, coeff=coeff))
+        return nn.Sequential(*blocks)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = self.stem(x)
+        x = self.group1(x)
+        x = self.group2(x)
+        x = self.group3(x)
+        x = F.relu(self.bn_final(x), inplace=True)
+        x = self.pool(x)
+        x = torch.flatten(x, 1)
+        return self.proj(x)
+
+
+class WRNNoSkipSupConSNGPClassifier(nn.Module):
+    """
+    WRN-28-10 depth/width, spectral norm, NO skip connections + RFGP head.
+
+    Uses WideResNet28NoSkipBackbone. Same interface as CifarResNetSupConSNGPClassifier
+    including return_features=True for MS/SupCon losses.
+    """
+
+    def __init__(
+        self,
+        num_classes: int = 10,
+        widen_factor: int = 10,
+        hidden_dim: int = 128,
+        spec_norm_bound: float = 6.0,
+        num_inducing: int = 1024,
+        ridge_penalty: float = 1e-3,
+        feature_scale: float = 2.0,
+        gp_cov_momentum: float = 0.999,
+        normalize_input: bool = False,
+        kernel_type: str = "normalized_rbf",
+        input_normalization: str = "l2",
+        kernel_scale: float = 1.0,
+        length_scale: float = 1.0,
+    ):
+        super().__init__()
+        self.backbone = WideResNet28NoSkipBackbone(
+            widen_factor=widen_factor, hidden_dim=hidden_dim, coeff=spec_norm_bound
+        )
+        self.classifier = RandomFeatureGaussianProcess(
+            in_features=hidden_dim,
+            out_features=num_classes,
+            num_inducing=num_inducing,
+            ridge_penalty=ridge_penalty,
+            feature_scale=feature_scale,
+            gp_cov_momentum=gp_cov_momentum,
+            normalize_input=normalize_input,
+            kernel_type=kernel_type,
+            input_normalization=input_normalization,
+            kernel_scale=kernel_scale,
+            length_scale=length_scale,
+        )
+
+    def reset_precision_matrix(self) -> None:
+        self.classifier.reset_precision_matrix()
+
+    def encode(self, x: torch.Tensor) -> torch.Tensor:
+        return self.backbone(x)
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        return_cov: bool = False,
+        update_precision: bool = False,
+        return_features: bool = False,
+    ):
+        features = self.encode(x)
+        outputs = self.classifier(
+            features, return_cov=return_cov, update_precision=update_precision
+        )
+        if return_features:
+            return outputs, features
+        return outputs

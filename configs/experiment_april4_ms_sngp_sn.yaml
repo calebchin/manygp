@@ -1,0 +1,55 @@
+experiment:
+  name: cifar10_ms_sngp_sn
+  smoke_test: false
+
+data:
+  root: ../datafolder/data
+  batch_size: 256
+  num_workers: 2
+
+model:
+  # Same SN WRN-28-10 backbone as the plain SNGP baseline
+  num_classes: 10
+  widen_factor: 10
+  hidden_dim: 128          # GP input projection dimension
+  spec_norm_bound: 6.0     # Paper value for CIFAR (Table 5)
+  kernel_type: normalized_rbf
+  input_normalization: l2  # cosine geometry — matches MS Loss which uses cosine similarity
+  kernel_scale: 1.0
+  length_scale: 1.0
+  num_inducing: 1024
+  ridge_penalty: 0.001
+  feature_scale: 2.0
+  gp_cov_momentum: 0.999
+  normalize_input: false   # l2 input_normalization above already handles this
+
+training:
+  epochs: 200
+  eval_interval: 5
+  log_every_steps: 20
+  lr: 0.001
+  weight_decay: 0.0
+  num_mc_samples: 10
+  ms_alpha: 2.0
+  ms_beta: 50.0
+  ms_base: 0.5
+  ms_eps: 0.1
+  ms_loss_weight: 1.0
+  ce_loss_weight: 1.0
+
+ood:
+  enabled: true
+  cifarc_root: ../datafolder/data
+  corruptions: null
+  severities: [1, 2, 3, 4, 5]
+
+output:
+  checkpoint_path: ./checkpoints_april4/ms_sngp_sn/cifar10_ms_sngp_sn.pt
+  top_k: 5
+  checkpoint_metric: val_accuracy
+
+wandb:
+  enabled: true
+  project: april_4_experiments
+  entity: sta414manygp
+  run_name: ms_sngp_sn

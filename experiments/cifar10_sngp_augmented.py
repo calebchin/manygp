@@ -371,6 +371,11 @@ if __name__ == "__main__":
     parser.add_argument("--seed", type=int, default=None, help="Random seed (overrides config)")
     parser.add_argument("--run-name", type=str, default=None, dest="run_name",
                         help="W&B run name (overrides config)")
+    parser.add_argument("--num-inducing", type=int, default=None, dest="num_inducing",
+                        help="Number of random Fourier features for the GP head "
+                             "(overrides config model.num_inducing). More features = "
+                             "better kernel approximation at the cost of memory/compute. "
+                             "e.g. 1024 (default) or 4096.")
     args = parser.parse_args()
 
     with open(args.config) as f:
@@ -381,6 +386,21 @@ if __name__ == "__main__":
         if cfg.get("output", {}).get("checkpoint_path"):
             p = Path(cfg["output"]["checkpoint_path"])
             cfg["output"]["checkpoint_path"] = str(p.parent / f"seed{args.seed}" / p.name)
+    if args.num_inducing is not None:
+        cfg.setdefault("model", {})["num_inducing"] = args.num_inducing
+        # Tag the experiment name so the W&B table groups it separately
+        cfg.setdefault("experiment", {})["name"] = (
+            f"cifar10_sngp_aug_rff{args.num_inducing}"
+        )
+        # Also scope checkpoints to a separate directory so they don't collide
+        if cfg.get("output", {}).get("checkpoint_path"):
+            p = Path(cfg["output"]["checkpoint_path"])
+            rff_dir = p.parent.parent / f"sngp_aug_rff{args.num_inducing}"
+            seed_suffix = p.parent.name if p.parent.name.startswith("seed") else ""
+            cfg["output"]["checkpoint_path"] = str(
+                rff_dir / seed_suffix / p.name if seed_suffix
+                else rff_dir / p.name
+            )
     if args.run_name:
         cfg.setdefault("wandb", {})["run_name"] = args.run_name
 

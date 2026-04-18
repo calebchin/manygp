@@ -19,7 +19,7 @@ model:
   normalize_input: true  # Input layer normalization (paper Table 5: True)
 
 training:
-  epochs: 200
+  epochs: 100
   eval_interval: 5
   log_every_steps: 20
   lr: 0.001

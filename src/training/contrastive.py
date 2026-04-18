@@ -7,6 +7,104 @@ import torch.nn.functional as F
 from tqdm.auto import tqdm
 
 
+class MultiSimilarityLoss(torch.nn.Module):
+    """
+    Multi-Similarity Loss (Wang et al., CVPR 2019).
+    https://arxiv.org/abs/1904.06627
+
+    Unlike SupCon, which gives uniform weight to all same-class pairs, MS Loss
+    reweights each pair by three complementary similarity signals:
+      - Self-similarity (how hard is this pair on its own)
+      - Relative to positives (is this negative dangerously close?)
+      - Relative to negatives (is this positive embarrassingly far?)
+
+    This focuses gradient on boundary-straddling pairs — exactly what a GP
+    uncertainty model needs: tight, distance-meaningful class clusters with
+    no wasted capacity on already-correct pairs.
+
+    Args:
+        alpha:  Positive-pair scale factor (default 2.0).
+        beta:   Negative-pair scale factor (default 50.0).
+        base:   Similarity threshold λ; pairs below (positives) or above
+                (negatives) λ contribute to the loss (default 0.5 for
+                cosine-normalized embeddings).
+        eps:    Mining margin ε. Only include positive pair (i,k) if
+                s_ik < max_neg + eps; only include negative pair (i,k) if
+                s_ik > min_pos - eps (default 0.1).
+
+    Input:
+        features : (N, D) — L2-normalised embeddings (or raw; will be
+                   normalised internally).  For multi-view batches, flatten
+                   (B, V, D) → (B*V, D) and repeat labels V times before
+                   passing in.
+        labels   : (N,) integer class labels.
+    """
+
+    def __init__(
+        self,
+        alpha: float = 2.0,
+        beta: float  = 50.0,
+        base: float  = 0.5,
+        eps: float   = 0.1,
+    ):
+        super().__init__()
+        self.alpha = alpha
+        self.beta  = beta
+        self.base  = base
+        self.eps   = eps
+
+    def forward(self, features: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
+        if features.ndim != 2:
+            raise ValueError(
+                f"MSLoss expects (N, D) features, got {features.shape}. "
+                "Flatten multi-view inputs before passing in."
+            )
+        features = F.normalize(features, dim=-1)          # (N, D)
+        sim = features @ features.T                        # (N, N) cosine sims
+
+        N = features.size(0)
+        eye_mask = torch.eye(N, dtype=torch.bool, device=features.device)
+
+        losses: list[torch.Tensor] = []
+        for i in range(N):
+            pos_mask = (labels == labels[i]) & ~eye_mask[i]   # same-class, not self
+            neg_mask = (labels != labels[i])                   # different-class
+
+            if not pos_mask.any() or not neg_mask.any():
+                continue
+
+            pos_sims = sim[i][pos_mask]   # (|P_i|,)
+            neg_sims = sim[i][neg_mask]   # (|N_i|,)
+
+            # Mining: keep only informative pairs
+            # Positive pair (i,k) is informative if it's NOT already separated
+            # further than the closest negative: s_ik < max(neg) + eps
+            pos_sims = pos_sims[pos_sims < neg_sims.max() + self.eps]
+            # Negative pair (i,k) is informative if it's NOT already farther
+            # than the farthest positive: s_ik > min(pos) - eps
+            neg_sims = neg_sims[neg_sims > pos_sims.min() - self.eps] \
+                if pos_sims.numel() > 0 else neg_sims
+
+            if pos_sims.numel() == 0 or neg_sims.numel() == 0:
+                continue
+
+            pos_loss = (1.0 / self.alpha) * torch.log(
+                1.0 + torch.sum(torch.exp(-self.alpha * (pos_sims - self.base)))
+            )
+            neg_loss = (1.0 / self.beta) * torch.log(
+                1.0 + torch.sum(torch.exp(self.beta * (neg_sims - self.base)))
+            )
+            losses.append(pos_loss + neg_loss)
+
+        if not losses:
+            return features.sum() * 0.0   # differentiable zero
+
+        loss = torch.stack(losses).mean()
+        if not torch.isfinite(loss):
+            raise RuntimeError("MS Loss became non-finite")
+        return loss
+
+
 class SupConLoss(torch.nn.Module):
     """Supervised contrastive loss from https://arxiv.org/abs/2004.11362."""
 

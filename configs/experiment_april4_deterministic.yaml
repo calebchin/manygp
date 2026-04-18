@@ -13,7 +13,7 @@ model:
   embedding_dim: 128     # Encoder output dimension before classifier head
 
 training:
-  epochs: 200
+  epochs: 100
   eval_interval: 5
   log_every_steps: 20
   lr: 0.001
