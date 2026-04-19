@@ -6,10 +6,13 @@ Usage:
 """
 
 import argparse
+import copy
 import math
 import os
 import sys
+from datetime import datetime
 from pathlib import Path
+from uuid import uuid4
 
 import torch
 import yaml
@@ -20,6 +23,13 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from src.data.cifar10 import get_cifar10_loaders, get_cifar10_supcon_loaders
 from src.models.sngp import SNGPResNetClassifier, laplace_predictive_probs
 from src.utils.model_summary import print_model_summary
+
+
+def resolve_timestamped_checkpoint_path(checkpoint_path: str) -> str:
+    checkpoint_target = Path(checkpoint_path)
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    random_suffix = uuid4().hex[:8]
+    return str(checkpoint_target.parent / f"{timestamp}_{random_suffix}" / checkpoint_target.name)
 
 
 def update_topk_checkpoints(
@@ -209,9 +219,16 @@ def main(cfg: dict) -> None:
     num_mc_samples = train_cfg.get("num_mc_samples", 10)
     output_cfg = cfg.get("output", {})
     checkpoint_path = output_cfg.get("checkpoint_path")
+    resolved_checkpoint_path = resolve_timestamped_checkpoint_path(checkpoint_path) if checkpoint_path else None
     top_k = output_cfg.get("top_k", 1)
     saved_checkpoints: list[dict] = []
     global_step = 0
+
+    if resolved_checkpoint_path is not None:
+        print(f"Checkpoint directory: {Path(resolved_checkpoint_path).parent}")
+
+    runtime_cfg = copy.deepcopy(cfg)
+    runtime_cfg.setdefault("output", {})["resolved_checkpoint_path"] = resolved_checkpoint_path
 
     epoch_progress = tqdm(range(1, num_epochs + 1), desc="Epoch", leave=True)
     for epoch in epoch_progress:
@@ -292,13 +309,13 @@ def main(cfg: dict) -> None:
             "val_accuracy": val_acc,
             "val_loss": val_loss,
             "val_nll": val_nll,
-            "config": cfg,
+            "config": runtime_cfg,
         }
-        if checkpoint_path:
+        if resolved_checkpoint_path:
             update_topk_checkpoints(
                 saved_checkpoints=saved_checkpoints,
                 top_k=top_k,
-                checkpoint_path=checkpoint_path,
+                checkpoint_path=resolved_checkpoint_path,
                 state=checkpoint_state,
                 metric_name="acc",
                 metric_value=val_acc,
@@ -334,9 +351,18 @@ def main(cfg: dict) -> None:
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="CIFAR-10 SNGP experiment")
     parser.add_argument("--config", required=True, help="Path to YAML config file")
+    parser.add_argument(
+        "--use-supcon-augmentations",
+        type=lambda x: x.lower() == "true",
+        default=None,
+        help="Override data.use_supcon_augmentations to false",
+    )
     args = parser.parse_args()
 
     with open(args.config) as f:
         cfg = yaml.safe_load(f)
+
+    if args.use_supcon_augmentations is not None:
+        cfg.setdefault("data", {})["use_supcon_augmentations"] = args.use_supcon_augmentations
 
     main(cfg)
