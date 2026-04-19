@@ -6,6 +6,7 @@ data:
   root: ../datafolder/data
   batch_size: 256
   num_workers: 4
+  use_supcon_augmentations: true
 
 model:
   num_classes: 10
@@ -19,8 +20,8 @@ model:
   normalize_input: false
 
 training:
-  epochs: 100
-  eval_interval: 5
+  epochs: 200
+  eval_interval: 1
   log_every_steps: 20
   lr: 0.001
   weight_decay: 0.0

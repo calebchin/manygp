@@ -17,7 +17,7 @@ from tqdm.auto import tqdm
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from src.data.cifar10 import get_cifar10_loaders
+from src.data.cifar10 import get_cifar10_loaders, get_cifar10_supcon_loaders
 from src.models.sngp import SNGPResNetClassifier, laplace_predictive_probs
 from src.utils.model_summary import print_model_summary
 
@@ -80,6 +80,10 @@ def train_epoch(
     for images, labels in progress:
         images = images.to(device, non_blocking=True)
         labels = labels.to(device, non_blocking=True)
+        if images.ndim == 5:
+            batch_size, num_views, channels, height, width = images.shape
+            images = images.view(batch_size * num_views, channels, height, width)
+            labels = labels.repeat_interleave(num_views)
 
         optimizer.zero_grad(set_to_none=True)
         logits = model(images, update_precision=True)
@@ -156,13 +160,23 @@ def main(cfg: dict) -> None:
         )
 
     data_cfg = cfg["data"]
-    train_loader, val_loader, train_dataset, val_dataset = get_cifar10_loaders(
-        data_root=data_cfg["root"],
-        batch_size=data_cfg["batch_size"],
-        num_workers=data_cfg["num_workers"],
-        smoke_test=smoke_test,
-    )
+    use_supcon_augmentations = data_cfg.get("use_supcon_augmentations", False)
+    if use_supcon_augmentations:
+        train_loader, _, val_loader, train_dataset, val_dataset = get_cifar10_supcon_loaders(
+            data_root=data_cfg["root"],
+            batch_size=data_cfg["batch_size"],
+            num_workers=data_cfg["num_workers"],
+            smoke_test=smoke_test,
+        )
+    else:
+        train_loader, val_loader, train_dataset, val_dataset = get_cifar10_loaders(
+            data_root=data_cfg["root"],
+            batch_size=data_cfg["batch_size"],
+            num_workers=data_cfg["num_workers"],
+            smoke_test=smoke_test,
+        )
     print(f"Train size: {len(train_dataset)}, val size: {len(val_dataset)}")
+    print(f"SupCon augmentations enabled: {use_supcon_augmentations}")
 
     model_cfg = cfg["model"]
     model = SNGPResNetClassifier(
