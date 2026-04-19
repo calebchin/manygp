@@ -1,0 +1,113 @@
+# Manifest for experiments/ambiguous_images.py
+#
+# CIFAR-10 class indices:
+#   0=airplane  1=automobile  2=bird  3=cat   4=deer
+#   5=dog       6=frog        7=horse 8=ship  9=truck
+#
+# Paths are relative to the repo root (manygp/).
+# All checkpoints below are seed 0 — a fair single-seed qualitative comparison.
+
+# ── 10 images: 5 ambiguous + 5 clearly-correct references ───────────────────
+images:
+
+  - description: "Shiba Inu — Dog vs Cat"
+    path: "data/ambiguous_images/01_shiba_inu_dog_vs_cat.jpg"
+    true_label: 5       # dog
+    class_pair: [5, 3]  # dog, cat
+
+  - description: "Suzuki Carry pickup — Truck vs Automobile"
+    path: "data/ambiguous_images/02_suzuki_carry_truck_vs_automobile.jpg"
+    true_label: 9       # truck
+    class_pair: [9, 1]  # truck, automobile
+
+  - description: "Passenger hovercraft — Ship vs Automobile"
+    path: "data/ambiguous_images/03_hovercraft_ship_vs_automobile.jpg"
+    true_label: 8       # ship
+    class_pair: [8, 1]  # ship, automobile
+
+  - description: "Osprey in flight silhouette — Bird vs Airplane"
+    path: "data/ambiguous_images/04_osprey_bird_vs_airplane.jpg"
+    true_label: 2       # bird
+    class_pair: [2, 0]  # bird, airplane
+
+  - description: "Young sika deer (no antlers) — Deer vs Horse"
+    path: "data/ambiguous_images/05_sika_deer_vs_horse.jpg"
+    true_label: 4       # deer
+    class_pair: [4, 7]  # deer, horse
+
+  # ── 5 clearly-correct reference images ──────────────────────────────────────
+  - description: "German Shepherd — clearly Dog"
+    path: "data/ambiguous_images/06_dog_clear.jpg"
+    true_label: 5       # dog
+    class_pair: [5, 5]
+
+  - description: "Mercedes Actros semi-truck — clearly Truck"
+    path: "data/ambiguous_images/07_truck_clear.jpg"
+    true_label: 9       # truck
+    class_pair: [9, 9]
+
+  - description: "Container ships at sea — clearly Ship"
+    path: "data/ambiguous_images/08_ship_clear.jpg"
+    true_label: 8       # ship
+    class_pair: [8, 8]
+
+  - description: "European robin perched — clearly Bird"
+    path: "data/ambiguous_images/09_bird_clear.jpg"
+    true_label: 2       # bird
+    class_pair: [2, 2]
+
+  - description: "Fallow deer with antlers — clearly Deer"
+    path: "data/ambiguous_images/10_deer_clear.jpg"
+    true_label: 4       # deer
+    class_pair: [4, 4]
+
+
+# ── Model checkpoints (seed 0) ─────────────────────────────────────────────────
+# Hybrid SNGP RFF4096 omitted — still training (submitted 2026-04-19).
+# Add it here once seed 0 finishes:
+#   - name: "Hybrid SNGP RFF4096"
+#     experiment: hybrid_sngp_rff4096
+#     config: configs/experiment_april4_hybrid_sngp_rff4096.yaml
+#     checkpoint: checkpoints_april4/hybrid_sngp_rff4096/seed0/<timestamp>/best_model.pt
+models:
+
+  - name: "SNGP"
+    experiment: sngp
+    config: configs/experiment_april2_sngp.yaml
+    checkpoint: checkpoints_april2/sngp/seed0/best_model.pt
+
+  - name: "SNGP+Aug"
+    experiment: sngp_augmented
+    config: configs/experiment_april2_sngp_augmented.yaml
+    checkpoint: checkpoints_april2/sngp_augmented/seed0/best_model.pt
+
+  - name: "SNGP+Aug RFF4096"
+    experiment: sngp_augmented
+    config: configs/experiment_april2_sngp_augmented.yaml
+    checkpoint: checkpoints_april2/sngp_augmented/sngp_aug_rff4096/seed0/best_model.pt
+    num_inducing_override: 4096   # config says 1024; checkpoint was trained with 4096
+
+  - name: "SupCon+SNGP"
+    experiment: supcon_sngp
+    config: configs/experiment_april2_supcon_sngp.yaml
+    checkpoint: checkpoints_april2/supcon_sngp/seed0/20260403_200044/best_model.pt
+
+  - name: "MS-SNGP"
+    experiment: ms_sngp
+    config: configs/experiment_april4_ms_sngp.yaml
+    checkpoint: checkpoints_april4/ms_sngp/seed0/20260416_001830/best_model.pt
+
+  - name: "MS-SNGP+SN"
+    experiment: ms_sngp_sn
+    config: configs/experiment_april4_ms_sngp_sn.yaml
+    checkpoint: checkpoints_april4/ms_sngp_sn/seed0/20260416_234804/best_model.pt
+
+  - name: "MS-SNGP NoSkip"
+    experiment: ms_sngp_no_skip
+    config: configs/experiment_april4_ms_sngp_no_skip.yaml
+    checkpoint: checkpoints_april4/ms_sngp_no_skip/seed0/20260416_164052/best_model.pt
+
+  - name: "Hybrid SNGP"
+    experiment: hybrid_sngp
+    config: configs/experiment_april4_hybrid_sngp.yaml
+    checkpoint: checkpoints_april4/hybrid_sngp/seed0/20260417_071917/best_model.pt

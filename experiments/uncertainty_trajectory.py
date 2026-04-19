@@ -77,20 +77,19 @@ def build_model(exp_type: str, cfg: dict, device: torch.device):
     elif exp_type == "ms_sngp_no_skip":
         from src.models.sngp import WRNNoSkipSupConSNGPClassifier
         return WRNNoSkipSupConSNGPClassifier(
-            embedding_dim       = model_cfg["embedding_dim"],
             num_classes         = model_cfg["num_classes"],
             widen_factor        = model_cfg.get("widen_factor", 10),
-            hidden_dims         = model_cfg["hidden_dims"],
-            dropout_rate        = model_cfg["dropout_rate"],
+            hidden_dim          = model_cfg["hidden_dim"],
+            spec_norm_bound     = model_cfg["spec_norm_bound"],
             num_inducing        = model_cfg["num_inducing"],
             ridge_penalty       = model_cfg["ridge_penalty"],
             feature_scale       = model_cfg["feature_scale"],
             gp_cov_momentum     = model_cfg["gp_cov_momentum"],
             normalize_input     = model_cfg["normalize_input"],
-            kernel_type         = model_cfg.get("kernel_type", "normalized_rbf"),
-            input_normalization = model_cfg.get("input_normalization", "l2"),
-            kernel_scale        = model_cfg.get("kernel_scale", 1.0),
-            length_scale        = model_cfg.get("length_scale", 1.0),
+            kernel_type         = model_cfg["kernel_type"],
+            input_normalization = model_cfg["input_normalization"],
+            kernel_scale        = model_cfg["kernel_scale"],
+            length_scale        = model_cfg["length_scale"],
         ).to(device)
 
     elif exp_type in ("ms_sngp", "supcon_sngp"):

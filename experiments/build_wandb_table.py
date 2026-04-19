@@ -56,7 +56,9 @@ DISPLAY_NAMES: dict[str, str] = {
     "cifar10_ms_sngp_cnn":      "MS-SNGP+CNN",
     "cifar10_ms_sngp_sn":       "MS-SNGP+SN",
     "cifar10_ms_sngp_no_skip":  "MS-SNGP NoSkip",
-    "cifar10_hybrid_sngp":      "Hybrid SNGP",
+    "cifar10_hybrid_sngp":              "Hybrid SNGP",
+    "cifar10_hybrid_sngp_rff4096":      "Hybrid SNGP RFF4096",
+    "cifar10_hybrid_sngp_rff4096_sc75": "Hybrid SNGP RFF4096 SC75",
     "cifar10_classifier":       "Deterministic",   # individual member — filtered out below
     "deep_ensemble":            "Deep Ensemble",
 }
@@ -75,6 +77,8 @@ ROW_ORDER = [
     "MS-SNGP+SN",
     "MS-SNGP NoSkip",
     "Hybrid SNGP",
+    "Hybrid SNGP RFF4096",
+    "Hybrid SNGP RFF4096 SC75",
     "Deep Ensemble",
 ]
 
@@ -89,7 +93,9 @@ _RUN_PREFIX_MAP: list[tuple[str, str]] = [
     ("ms_sngp_cnn_",      "cifar10_ms_sngp_cnn"),
     ("ms_sngp_sn_",       "cifar10_ms_sngp_sn"),
     ("ms_sngp_no_skip_", "cifar10_ms_sngp_no_skip"),
-    ("hybrid_sngp_",     "cifar10_hybrid_sngp"),
+    ("hybrid_sngp_rff4096_sc75_", "cifar10_hybrid_sngp_rff4096_sc75"),  # before rff4096_ and hybrid_sngp_
+    ("hybrid_sngp_rff4096_",     "cifar10_hybrid_sngp_rff4096"),       # before hybrid_sngp_
+    ("hybrid_sngp_",             "cifar10_hybrid_sngp"),
     ("ms_sngp_",          "cifar10_ms_sngp"),
     ("sngp_seed",         "cifar10_sngp"),
     ("deep_ensemble",     "deep_ensemble"),
