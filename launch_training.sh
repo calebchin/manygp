@@ -17,8 +17,8 @@ source /w/20252/wjcai/uq/manygp/venv/bin/activate
 # SUPCON_LOSS_WEIGHT="${1:-${SUPCON_LOSS_WEIGHT:-0.0}}"
 
 # echo "Running with supcon-loss-weight=${SUPCON_LOSS_WEIGHT}"
-# python /w/20252/wjcai/uq/manygp/experiments/cifar10_supcon_sngp.py \
-#   --config /w/20252/wjcai/uq/manygp/configs/cifar10_supcon_sngp.yaml \
-#   --supcon-loss-weight "${SUPCON_LOSS_WEIGHT}"
+python /w/20252/wjcai/uq/manygp/experiments/cifar10_supcon_sngp.py \
+  --config /w/20252/wjcai/uq/manygp/configs/cifar10_supcon_sngp.yaml \
+  --supcon-loss-weight "${SUPCON_LOSS_WEIGHT}"
 
-python experiments/cifar10_sngp.py --config configs/cifar10_sngp.yaml
+# python experiments/cifar10_sngp.py --config configs/cifar10_sngp.yaml
