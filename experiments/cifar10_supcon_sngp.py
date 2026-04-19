@@ -17,6 +17,7 @@ from pathlib import Path
 from uuid import uuid4
 
 import torch
+import torch.nn.functional as F
 import yaml
 from tqdm.auto import tqdm
 
@@ -153,9 +154,9 @@ def evaluate_joint_sngp(
     num_mc_samples: int = 10,
 ) -> dict[str, float]:
     model.eval()
-    running_loss = 0.0
     total_correct = 0
     total_examples = 0
+    total_ce_loss = 0.0
     total_nll = 0.0
 
     for images, labels in loader:
@@ -165,16 +166,16 @@ def evaluate_joint_sngp(
         logits, variances = model(images, return_cov=True)
         probs = laplace_predictive_probs(logits, variances, num_mc_samples=num_mc_samples)
         log_probs = probs.clamp_min(1e-12).log()
-        loss = -log_probs.gather(1, labels.unsqueeze(1)).mean()
+        total_ce_loss += F.cross_entropy(logits, labels, reduction="sum").item()
 
-        running_loss += loss.item()
         total_correct += (probs.argmax(dim=1) == labels).sum().item()
         total_examples += labels.size(0)
         total_nll += -log_probs.gather(1, labels.unsqueeze(1)).sum().item()
 
     return {
-        "loss": running_loss / len(loader),
+        "loss": total_nll / total_examples,
         "accuracy": total_correct / total_examples,
+        "ce_loss": total_ce_loss / total_examples,
         "nll": total_nll / total_examples,
     }
 
@@ -238,6 +239,7 @@ def main(cfg: dict) -> None:
     ce_loss_fn = torch.nn.CrossEntropyLoss()
 
     best_val_acc = -1.0
+    best_val_nll = float("inf")
     num_epochs = 1 if smoke_test else train_cfg["epochs"]
     eval_interval = 1 if smoke_test else train_cfg.get("eval_interval", 1)
     log_every_steps = train_cfg.get("log_every_steps", None)
@@ -292,12 +294,14 @@ def main(cfg: dict) -> None:
                 f"Train CE: {train_metrics['ce_loss']:.4f} | "
                 f"Train Acc: {train_metrics['accuracy'] * 100:.2f}% | "
                 f"Val Acc: {val_metrics['accuracy'] * 100:.2f}% | "
+                f"Val CE: {val_metrics['ce_loss']:.4f} | "
                 f"Val NLL: {val_metrics['nll']:.4f}"
             )
             epoch_progress.set_postfix(
                 train_total=f"{train_metrics['total_loss']:.4f}",
                 train_acc=f"{train_metrics['accuracy'] * 100:.2f}%",
                 val_acc=f"{val_metrics['accuracy'] * 100:.2f}%",
+                val_nll=f"{val_metrics['nll']:.4f}",
             )
         else:
             print(
@@ -324,6 +328,7 @@ def main(cfg: dict) -> None:
             if val_metrics is not None:
                 log_data["val/loss"] = val_metrics["loss"]
                 log_data["val/accuracy"] = val_metrics["accuracy"]
+                log_data["val/ce_loss"] = val_metrics["ce_loss"]
                 log_data["val/nll"] = val_metrics["nll"]
             run.log(log_data)
 
@@ -332,6 +337,7 @@ def main(cfg: dict) -> None:
 
         if val_metrics["accuracy"] > best_val_acc:
             best_val_acc = val_metrics["accuracy"]
+        best_val_nll = min(best_val_nll, val_metrics["nll"])
         checkpoint_state = {
             "epoch": epoch,
             "model_state_dict": model.state_dict(),
@@ -365,9 +371,16 @@ def main(cfg: dict) -> None:
     else:
         print("Best validation accuracy: not evaluated")
 
+    if best_val_nll < float("inf"):
+        print(f"Best validation NLL: {best_val_nll:.4f}")
+    else:
+        print("Best validation NLL: not evaluated")
+
     if run is not None:
         if best_val_acc >= 0.0:
             run.log({"best/val_accuracy": best_val_acc})
+        if best_val_nll < float("inf"):
+            run.log({"best/val_nll": best_val_nll})
         if saved_checkpoints:
             import wandb
 
