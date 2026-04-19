@@ -130,7 +130,7 @@ def main(cfg: dict, config_path: str) -> None:
     )
     print(f"Train size: {len(dataset_train)}, test size: {len(dataset_test)}")
 
-    # ── CNN pretraining ───────────────────────────────────────────────────────
+    # ── CNN initialiation ───────────────────────────────────────────────────────
     cnn_cfg = cfg["cnn"]
     cnn = WideResNet(
         input_size=32,
@@ -156,7 +156,8 @@ def main(cfg: dict, config_path: str) -> None:
     )
     print(f"Inducing points shape: {initial_inducing_points.shape}")
 
-    # ── DSPP model ────────────────────────────────────────────────────────────
+    # ── DKL model ────────────────────────────────────────────────────────────
+    dp_num_output = inducing.shape[1] if dkl_cfg["per_feature"] else dkl_cfg["num_output"]
     gp = GP(
         num_outputs=dp_num_output,
         initial_lengthscale=initial_lengthscale,
@@ -168,7 +169,6 @@ def main(cfg: dict, config_path: str) -> None:
     dkl = DKLModel(cnn, gp, objective, per_feature=dkl_cfg["per_feature"]).to(device)
 
     train_cfg = cfg["training"]
-    objective = SoftmaxLikelihood(num_features=dkl_cfg["num_output"], num_classes=cnn_cfg["num_classes"]).to(device)
 
     # ── Training ──────────────────────────────────────────────────────────────
     num_epochs = 1 if smoke_test else train_cfg["num_epochs"]
