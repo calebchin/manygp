@@ -422,6 +422,12 @@ if __name__ == "__main__":
         default=None,
         help="Optional override for experiment.seed",
     )
+    parser.add_argument(
+        "--run-name",
+        type=str,
+        default=None,
+        help="Optional override for wandb.run_name",
+    )
     args = parser.parse_args()
 
     with open(args.config) as f:
@@ -431,5 +437,7 @@ if __name__ == "__main__":
         cfg.setdefault("training", {})["supcon_loss_weight"] = args.supcon_loss_weight
     if args.seed is not None:
         cfg.setdefault("experiment", {})["seed"] = args.seed
+    if args.run_name is not None:
+        cfg.setdefault("wandb", {})["run_name"] = args.run_name
 
     main(cfg)
