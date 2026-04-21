@@ -5,6 +5,61 @@ import torch
 from torch.utils.data import DataLoader
 
 
+def _classification_ece(probs: torch.Tensor, labels: torch.Tensor, n_bins: int = 15) -> float:
+    """
+    Expected Calibration Error for multi-class classification.
+
+    Args:
+        probs:  (N, C) predicted class probabilities.
+        labels: (N,) ground-truth class indices.
+        n_bins: Number of equal-width confidence bins.
+
+    Returns:
+        ECE in [0, 1].
+    """
+    confidences, preds = probs.max(dim=-1)
+    correct = (preds == labels).float()
+
+    bin_edges = torch.linspace(0.0, 1.0, n_bins + 1)
+    ece = 0.0
+    n = len(confidences)
+    for lo, hi in zip(bin_edges[:-1], bin_edges[1:]):
+        mask = (confidences >= lo) & (confidences < hi)
+        if mask.sum() == 0:
+            continue
+        bin_acc = correct[mask].mean().item()
+        bin_conf = confidences[mask].mean().item()
+        ece += (mask.sum().item() / n) * abs(bin_acc - bin_conf)
+    return ece
+
+
+def _classification_mce(probs: torch.Tensor, labels: torch.Tensor, n_bins: int = 15) -> float:
+    """
+    Maximum Calibration Error for multi-class classification.
+
+    Args:
+        probs:  (N, C) predicted class probabilities.
+        labels: (N,) ground-truth class indices.
+        n_bins: Number of equal-width confidence bins.
+
+    Returns:
+        MCE in [0, 1].
+    """
+    confidences, preds = probs.max(dim=-1)
+    correct = (preds == labels).float()
+
+    bin_edges = torch.linspace(0.0, 1.0, n_bins + 1)
+    mce = 0.0
+    for lo, hi in zip(bin_edges[:-1], bin_edges[1:]):
+        mask = (confidences >= lo) & (confidences < hi)
+        if mask.sum() == 0:
+            continue
+        bin_acc = correct[mask].mean().item()
+        bin_conf = confidences[mask].mean().item()
+        mce = max(mce, abs(bin_acc - bin_conf))
+    return mce
+
+
 def evaluate_classifier(model, test_loader: DataLoader, cnn, device, run=None) -> dict:
     """
     Evaluate a TwoLayerDSPPClassifier on a test set.

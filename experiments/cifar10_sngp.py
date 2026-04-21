@@ -25,6 +25,9 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from src.data.cifar10 import get_cifar10_loaders, get_cifar10_two_view_classification_loaders
 from src.models.sngp import SNGPResNetClassifier, laplace_predictive_probs
+from src.training.evaluate import _classification_ece
+from src.training.ood_evaluate import collect_logits_and_probs
+from src.utils.model_loader import ModelWrapper
 from src.utils.model_summary import print_model_summary
 
 
@@ -144,6 +147,8 @@ def evaluate_sngp(
     total_correct = 0
     total_examples = 0
     total_nll = 0.0
+    all_probs: list[torch.Tensor] = []
+    all_labels: list[torch.Tensor] = []
 
     for images, labels in loader:
         images = images.to(device, non_blocking=True)
@@ -157,11 +162,18 @@ def evaluate_sngp(
         total_correct += (probs.argmax(dim=1) == labels).sum().item()
         total_examples += labels.size(0)
         total_nll += -log_probs.gather(1, labels.unsqueeze(1)).sum().item()
+        all_probs.append(probs.cpu())
+        all_labels.append(labels.cpu())
+
+    all_probs_t = torch.cat(all_probs, dim=0)
+    all_labels_t = torch.cat(all_labels, dim=0)
+    ece = _classification_ece(all_probs_t, all_labels_t)
 
     return {
         "loss": running_loss / len(loader),
         "accuracy": total_correct / total_examples,
         "nll": total_nll / total_examples,
+        "ece": ece,
     }
 
 
@@ -239,6 +251,8 @@ def main(cfg: dict) -> None:
     )
     loss_fn = torch.nn.CrossEntropyLoss()
     best_acc = -1.0
+    best_nll = float("inf")
+    best_ece = float("inf")
     num_epochs = 1 if smoke_test else train_cfg["epochs"]
     eval_interval = 1 if smoke_test else train_cfg.get("eval_interval", 1)
     log_every_steps = train_cfg.get("log_every_steps", None)
@@ -276,6 +290,7 @@ def main(cfg: dict) -> None:
         val_loss = None
         val_acc = None
         val_nll = None
+        val_ece = None
         if should_evaluate:
             metrics = evaluate_sngp(
                 model=model,
@@ -286,18 +301,21 @@ def main(cfg: dict) -> None:
             val_loss = metrics["loss"]
             val_acc = metrics["accuracy"]
             val_nll = metrics["nll"]
+            val_ece = metrics["ece"]
             print(
                 f"Epoch {epoch:3d}/{num_epochs} | "
                 f"Train Loss: {train_loss:.4f} | "
                 f"Train Acc: {train_acc * 100:.2f}% | "
                 f"Val Loss: {val_loss:.4f} | "
                 f"Val Acc: {val_acc * 100:.2f}% | "
-                f"Val NLL: {val_nll:.4f}"
+                f"Val NLL: {val_nll:.4f} | "
+                f"Val ECE: {val_ece:.4f}"
             )
             epoch_progress.set_postfix(
                 train_loss=f"{train_loss:.4f}",
                 train_acc=f"{train_acc * 100:.2f}%",
                 val_acc=f"{val_acc * 100:.2f}%",
+                val_ece=f"{val_ece:.4f}",
             )
         else:
             print(
@@ -317,10 +335,11 @@ def main(cfg: dict) -> None:
                 "train/lr": optimizer.param_groups[0]["lr"],
                 "train/epoch": epoch,
             }
-            if val_loss is not None and val_acc is not None and val_nll is not None:
+            if val_loss is not None and val_acc is not None and val_nll is not None and val_ece is not None:
                 log_data["eval/loss"] = val_loss
                 log_data["eval/accuracy"] = val_acc
                 log_data["eval/nll"] = val_nll
+                log_data["eval/ece"] = val_ece
             run.log(log_data)
 
         if val_acc is None:
@@ -328,6 +347,10 @@ def main(cfg: dict) -> None:
 
         if val_acc > best_acc:
             best_acc = val_acc
+        if val_nll is not None:
+            best_nll = min(best_nll, val_nll)
+        if val_ece is not None:
+            best_ece = min(best_ece, val_ece)
         checkpoint_state = {
             "epoch": epoch,
             "model_state_dict": model.state_dict(),
@@ -335,6 +358,7 @@ def main(cfg: dict) -> None:
             "val_accuracy": val_acc,
             "val_loss": val_loss,
             "val_nll": val_nll,
+            "val_ece": val_ece,
             "config": runtime_cfg,
         }
         if resolved_checkpoint_path:
@@ -362,9 +386,72 @@ def main(cfg: dict) -> None:
     else:
         print("Best validation accuracy: not evaluated")
 
+    if best_nll < float("inf"):
+        print(f"Best validation NLL: {best_nll:.4f}")
+    else:
+        print("Best validation NLL: not evaluated")
+
+    if best_ece < float("inf"):
+        print(f"Best validation ECE: {best_ece:.4f}")
+    else:
+        print("Best validation ECE: not evaluated")
+
+    test_metrics: dict[str, float] | None = None
+    if saved_checkpoints:
+        best_ckpt = torch.load(saved_checkpoints[0]["path"], map_location=device)
+        model.load_state_dict(best_ckpt["model_state_dict"])
+
+        print("\nEvaluating best checkpoint on held-out evaluation split...")
+        test_metrics = evaluate_sngp(model, val_loader, device, num_mc_samples)
+        print(
+            f"Test Acc: {test_metrics['accuracy'] * 100:.2f}% | "
+            f"Test NLL: {test_metrics['nll']:.4f} | "
+            f"Test ECE: {test_metrics['ece']:.4f}"
+        )
+
+        if run is not None:
+            run.log({
+                "test/accuracy": test_metrics["accuracy"],
+                "test/nll": test_metrics["nll"],
+                "test/ece": test_metrics["ece"],
+                "test/loss": test_metrics["loss"],
+            })
+
+        if not smoke_test and cfg.get("ood", {}).get("enabled", True):
+            print("\nRunning OOD evaluation (SVHN + CIFAR-100)...")
+            from src.training.post_training_eval import run_ood_eval
+
+            wrapper = ModelWrapper(
+                model=model,
+                has_cov=True,
+                num_mc_samples=num_mc_samples,
+                model_type="sngp",
+            )
+            id_logits, id_probs, _, _ = collect_logits_and_probs(
+                wrapper,
+                val_loader,
+                device,
+                num_mc_samples,
+            )
+            run_ood_eval(
+                model=model,
+                has_cov=True,
+                id_logits=id_logits,
+                id_probs=id_probs,
+                cfg=cfg,
+                device=device,
+                run=run,
+                num_mc_samples=num_mc_samples,
+                model_type="sngp",
+            )
+
     if run is not None:
         if best_acc >= 0.0:
             run.log({"best/val_accuracy": best_acc})
+        if best_nll < float("inf"):
+            run.log({"best/val_nll": best_nll})
+        if best_ece < float("inf"):
+            run.log({"best/val_ece": best_ece})
         if saved_checkpoints:
             import wandb
 
