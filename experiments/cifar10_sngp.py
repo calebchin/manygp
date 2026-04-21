@@ -3,6 +3,7 @@ CIFAR-10 SNGP training with a spectrally normalized ResNet backbone.
 
 Usage:
     python experiments/cifar10_sngp.py --config configs/cifar10_sngp.yaml
+    python experiments/cifar10_sngp.py --config configs/cifar10_sngp.yaml --train-dataset supcon_two_view
 """
 
 import argparse
@@ -20,7 +21,7 @@ from tqdm.auto import tqdm
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from src.data.cifar10 import get_cifar10_loaders, get_cifar10_supcon_loaders
+from src.data.cifar10 import get_cifar10_loaders, get_cifar10_two_view_classification_loaders
 from src.models.sngp import SNGPResNetClassifier, laplace_predictive_probs
 from src.utils.model_summary import print_model_summary
 
@@ -170,23 +171,31 @@ def main(cfg: dict) -> None:
         )
 
     data_cfg = cfg["data"]
-    use_supcon_augmentations = data_cfg.get("use_supcon_augmentations", False)
-    if use_supcon_augmentations:
-        train_loader, _, val_loader, train_dataset, val_dataset = get_cifar10_supcon_loaders(
+    train_dataset_name = data_cfg.get("train_dataset")
+    if train_dataset_name is None:
+        train_dataset_name = "supcon_two_view" if data_cfg.get("use_supcon_augmentations", False) else "standard"
+
+    if train_dataset_name == "supcon_two_view":
+        train_loader, val_loader, train_dataset, val_dataset = get_cifar10_two_view_classification_loaders(
             data_root=data_cfg["root"],
             batch_size=data_cfg["batch_size"],
             num_workers=data_cfg["num_workers"],
             smoke_test=smoke_test,
         )
-    else:
+    elif train_dataset_name == "standard":
         train_loader, val_loader, train_dataset, val_dataset = get_cifar10_loaders(
             data_root=data_cfg["root"],
             batch_size=data_cfg["batch_size"],
             num_workers=data_cfg["num_workers"],
             smoke_test=smoke_test,
         )
+    else:
+        raise ValueError(
+            f"Unsupported data.train_dataset={train_dataset_name!r}. "
+            "Expected one of: 'standard', 'supcon_two_view'."
+        )
     print(f"Train size: {len(train_dataset)}, val size: {len(val_dataset)}")
-    print(f"SupCon augmentations enabled: {use_supcon_augmentations}")
+    print(f"Training dataset: {train_dataset_name}")
 
     model_cfg = cfg["model"]
     model = SNGPResNetClassifier(
@@ -352,10 +361,16 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="CIFAR-10 SNGP experiment")
     parser.add_argument("--config", required=True, help="Path to YAML config file")
     parser.add_argument(
+        "--train-dataset",
+        choices=("standard", "supcon_two_view"),
+        default=None,
+        help="Override data.train_dataset",
+    )
+    parser.add_argument(
         "--use-supcon-augmentations",
         type=lambda x: x.lower() == "true",
         default=None,
-        help="Override data.use_supcon_augmentations to false",
+        help="Backward-compatible override mapped to data.train_dataset",
     )
     args = parser.parse_args()
 
@@ -363,6 +378,10 @@ if __name__ == "__main__":
         cfg = yaml.safe_load(f)
 
     if args.use_supcon_augmentations is not None:
-        cfg.setdefault("data", {})["use_supcon_augmentations"] = args.use_supcon_augmentations
+        cfg.setdefault("data", {})["train_dataset"] = (
+            "supcon_two_view" if args.use_supcon_augmentations else "standard"
+        )
+    if args.train_dataset is not None:
+        cfg.setdefault("data", {})["train_dataset"] = args.train_dataset
 
     main(cfg)
