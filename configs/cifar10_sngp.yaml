@@ -34,6 +34,6 @@ output:
 
 wandb:
   enabled: true
-  project: sngp
+  project: sngp_aug_effect
   entity: sta414manygp
   run_name: vanilla_sngp
