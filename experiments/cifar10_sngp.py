@@ -10,11 +10,13 @@ import argparse
 import copy
 import math
 import os
+import random
 import sys
 from datetime import datetime
 from pathlib import Path
 from uuid import uuid4
 
+import numpy as np
 import torch
 import yaml
 from tqdm.auto import tqdm
@@ -24,6 +26,16 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from src.data.cifar10 import get_cifar10_loaders, get_cifar10_two_view_classification_loaders
 from src.models.sngp import SNGPResNetClassifier, laplace_predictive_probs
 from src.utils.model_summary import print_model_summary
+
+
+def set_seed(seed: int) -> None:
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
 
 
 def resolve_timestamped_checkpoint_path(checkpoint_path: str) -> str:
@@ -155,6 +167,11 @@ def evaluate_sngp(
 
 def main(cfg: dict) -> None:
     smoke_test = cfg["experiment"]["smoke_test"]
+    seed = cfg["experiment"].get("seed")
+    if seed is not None:
+        set_seed(seed)
+        print(f"Seed: {seed}")
+
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Device: {device}")
 
@@ -372,6 +389,12 @@ if __name__ == "__main__":
         default=None,
         help="Backward-compatible override mapped to data.train_dataset",
     )
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=None,
+        help="Optional override for experiment.seed",
+    )
     args = parser.parse_args()
 
     with open(args.config) as f:
@@ -383,5 +406,7 @@ if __name__ == "__main__":
         )
     if args.train_dataset is not None:
         cfg.setdefault("data", {})["train_dataset"] = args.train_dataset
+    if args.seed is not None:
+        cfg.setdefault("experiment", {})["seed"] = args.seed
 
     main(cfg)
