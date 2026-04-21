@@ -1,6 +1,7 @@
 experiment:
   name: cifar10_supcon_sngp
   smoke_test: false
+  seed: 42
 
 data:
   root: ../datafolder/data
@@ -40,6 +41,6 @@ output:
 
 wandb:
   enabled: true
-  project: sngp
+  project: sngp_lambda_exp
   entity: sta414manygp
   run_name: cifar10_supcon_sngp

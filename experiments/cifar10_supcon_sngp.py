@@ -11,11 +11,13 @@ from __future__ import annotations
 import argparse
 import copy
 import os
+import random
 import sys
 from datetime import datetime
 from pathlib import Path
 from uuid import uuid4
 
+import numpy as np
 import torch
 import torch.nn.functional as F
 import yaml
@@ -28,6 +30,16 @@ from src.models.sngp import laplace_predictive_probs
 from src.models.supcon_sngp import CifarResNetSupConSNGPClassifier
 from src.training.contrastive import SupConLoss
 from src.utils.model_summary import print_model_summary
+
+
+def set_seed(seed: int) -> None:
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
 
 
 def resolve_timestamped_checkpoint_path(checkpoint_path: str) -> str:
@@ -182,6 +194,11 @@ def evaluate_joint_sngp(
 
 def main(cfg: dict) -> None:
     smoke_test = cfg["experiment"]["smoke_test"]
+    seed = cfg["experiment"].get("seed")
+    if seed is not None:
+        set_seed(seed)
+        print(f"Seed: {seed}")
+
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Device: {device}")
 
@@ -399,6 +416,12 @@ if __name__ == "__main__":
         default=None,
         help="Optional override for training.supcon_loss_weight",
     )
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=None,
+        help="Optional override for experiment.seed",
+    )
     args = parser.parse_args()
 
     with open(args.config) as f:
@@ -406,5 +429,7 @@ if __name__ == "__main__":
 
     if args.supcon_loss_weight is not None:
         cfg.setdefault("training", {})["supcon_loss_weight"] = args.supcon_loss_weight
+    if args.seed is not None:
+        cfg.setdefault("experiment", {})["seed"] = args.seed
 
     main(cfg)
