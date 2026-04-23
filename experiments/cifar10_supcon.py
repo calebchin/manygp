@@ -10,6 +10,7 @@ import os
 import random
 import sys
 from pathlib import Path
+from uuid import uuid4
 
 import numpy as np
 import torch
@@ -34,6 +35,14 @@ def set_seed(seed: int) -> None:
     torch.backends.cudnn.benchmark = False
 
 
+def resolve_randomized_checkpoint_path(checkpoint_path: str) -> str:
+    checkpoint_target = Path(checkpoint_path)
+    random_suffix = uuid4().hex[:8]
+    checkpoint_dir = checkpoint_target.parent
+    resolved_dir = checkpoint_dir.parent / f"{checkpoint_dir.name}_{random_suffix}"
+    return str(resolved_dir / checkpoint_target.name)
+
+
 def update_topk_checkpoints(
     saved_checkpoints: list[dict],
     top_k: int,
@@ -42,6 +51,7 @@ def update_topk_checkpoints(
     metric_name: str,
     metric_value: float,
     epoch: int,
+    higher_is_better: bool = True,
 ) -> None:
     if top_k <= 0:
         return
@@ -58,16 +68,26 @@ def update_topk_checkpoints(
         torch.save(state, candidate_path)
         saved_checkpoints.append({"metric": metric_value, "path": candidate_path, "epoch": epoch})
     else:
-        worst_checkpoint = min(saved_checkpoints, key=lambda item: (item["metric"], -item["epoch"]))
-        if metric_value <= worst_checkpoint["metric"]:
+        if higher_is_better:
+            worst_checkpoint = min(saved_checkpoints, key=lambda item: (item["metric"], -item["epoch"]))
+            should_save = metric_value > worst_checkpoint["metric"]
+            reverse = True
+        else:
+            worst_checkpoint = max(saved_checkpoints, key=lambda item: (item["metric"], item["epoch"]))
+            should_save = metric_value < worst_checkpoint["metric"]
+            reverse = False
+
+        if not should_save:
             return
 
         torch.save(state, candidate_path)
         saved_checkpoints.append({"metric": metric_value, "path": candidate_path, "epoch": epoch})
         worst_checkpoint["path"].unlink(missing_ok=True)
         saved_checkpoints.remove(worst_checkpoint)
+        saved_checkpoints.sort(key=lambda item: item["metric"], reverse=reverse)
+        return
 
-    saved_checkpoints.sort(key=lambda item: item["metric"], reverse=True)
+    saved_checkpoints.sort(key=lambda item: item["metric"], reverse=higher_is_better)
 
 
 def main(cfg: dict) -> None:
@@ -136,14 +156,19 @@ def main(cfg: dict) -> None:
     loss_fn = SupConLoss(temperature=train_cfg["supcon_temperature"])
 
     best_acc = -1.0
+    best_val_supcon_loss = float("inf")
     num_epochs = 1 if smoke_test else train_cfg["epochs"]
     eval_interval = 1 if smoke_test else train_cfg.get("eval_interval", 1)
     log_every_steps = train_cfg.get("log_every_steps", None)
     output_cfg = cfg.get("output", {})
     checkpoint_path = output_cfg.get("checkpoint_path")
+    resolved_checkpoint_path = resolve_randomized_checkpoint_path(checkpoint_path) if checkpoint_path else None
     top_k = output_cfg.get("top_k", 1)
     saved_checkpoints: list[dict] = []
     global_step = 0
+
+    if resolved_checkpoint_path is not None:
+        print(f"Checkpoint directory: {Path(resolved_checkpoint_path).parent}")
 
     epoch_progress = tqdm(range(1, num_epochs + 1), desc="Epoch", leave=True)
     for epoch in epoch_progress:
@@ -213,37 +238,47 @@ def main(cfg: dict) -> None:
 
         if knn_acc > best_acc:
             best_acc = knn_acc
+        if val_supcon_loss is not None and val_supcon_loss < best_val_supcon_loss:
+            best_val_supcon_loss = val_supcon_loss
         checkpoint_state = {
                 "epoch": epoch,
                 "model_state_dict": model.state_dict(),
                 "optimizer_state_dict": optimizer.state_dict(),
                 "knn_accuracy": knn_acc,
                 "val_supcon_loss": val_supcon_loss,
+                "resolved_checkpoint_path": resolved_checkpoint_path,
                 "config": cfg,
             }
-        if checkpoint_path:
+        if resolved_checkpoint_path and val_supcon_loss is not None:
             update_topk_checkpoints(
                 saved_checkpoints=saved_checkpoints,
                 top_k=top_k,
-                checkpoint_path=checkpoint_path,
+                checkpoint_path=resolved_checkpoint_path,
                 state=checkpoint_state,
-                metric_name="knn",
-                metric_value=knn_acc,
+                metric_name="supcon",
+                metric_value=val_supcon_loss,
                 epoch=epoch,
+                higher_is_better=False,
             )
 
     if saved_checkpoints:
         print("Saved top checkpoints:")
         for checkpoint in saved_checkpoints:
-            print(f"  epoch {checkpoint['epoch']:3d} | k-NN {checkpoint['metric'] * 100:.2f}% | {checkpoint['path']}")
+            print(f"  epoch {checkpoint['epoch']:3d} | val SupCon {checkpoint['metric']:.4f} | {checkpoint['path']}")
 
     if best_acc >= 0.0:
         print(f"Best k-NN accuracy: {best_acc * 100:.2f}%")
     else:
         print("Best k-NN accuracy: not evaluated")
+    if best_val_supcon_loss < float("inf"):
+        print(f"Best val SupCon loss: {best_val_supcon_loss:.4f}")
+    else:
+        print("Best val SupCon loss: not evaluated")
     if run is not None:
         if best_acc >= 0.0:
             run.log({"best/knn_accuracy": best_acc})
+        if best_val_supcon_loss < float("inf"):
+            run.log({"best/supcon_loss": best_val_supcon_loss})
         if saved_checkpoints:
             import wandb
 
@@ -268,6 +303,20 @@ if __name__ == "__main__":
         default=None,
         help="Optional override for wandb.run_name",
     )
+    projection_group = parser.add_mutually_exclusive_group()
+    projection_group.add_argument(
+        "--use-projection-head",
+        dest="use_projection_head",
+        action="store_true",
+        help="Override model.use_projection_head to true",
+    )
+    projection_group.add_argument(
+        "--no-use-projection-head",
+        dest="use_projection_head",
+        action="store_false",
+        help="Override model.use_projection_head to false",
+    )
+    parser.set_defaults(use_projection_head=None)
     args = parser.parse_args()
 
     with open(args.config) as f:
@@ -277,5 +326,7 @@ if __name__ == "__main__":
         cfg.setdefault("experiment", {})["seed"] = args.seed
     if args.run_name is not None:
         cfg.setdefault("wandb", {})["run_name"] = args.run_name
+    if args.use_projection_head is not None:
+        cfg.setdefault("model", {})["use_projection_head"] = args.use_projection_head
 
     main(cfg)

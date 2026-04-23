@@ -32,6 +32,6 @@ output:
 
 wandb:
   enabled: true
-  project: sngp
+  project: supcon_gmm
   entity: sta414manygp
   run_name: test_run
