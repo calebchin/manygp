@@ -107,6 +107,8 @@ def main(cfg: dict) -> None:
         projection_dim=model_cfg["projection_dim"],
         projection_hidden_dim=model_cfg["projection_hidden_dim"],
         width=model_cfg["width"],
+        spec_norm_bound=model_cfg.get("spec_norm_bound", 0.95),
+        use_projection_head=model_cfg.get("use_projection_head", True),
     ).to(device)
     print_model_summary(model)
     train_cfg = cfg["training"]

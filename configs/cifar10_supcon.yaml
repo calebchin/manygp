@@ -10,9 +10,11 @@ data:
 
 model:
   embedding_dim: 128
+  use_projection_head: true
   projection_dim: 128
   projection_hidden_dim: 256
   width: 64
+  spec_norm_bound: 0.95
 
 training:
   epochs: 100
