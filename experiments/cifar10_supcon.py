@@ -249,22 +249,21 @@ def main(cfg: dict) -> None:
                 "resolved_checkpoint_path": resolved_checkpoint_path,
                 "config": cfg,
             }
-        if resolved_checkpoint_path and val_supcon_loss is not None:
+        if resolved_checkpoint_path:
             update_topk_checkpoints(
                 saved_checkpoints=saved_checkpoints,
                 top_k=top_k,
                 checkpoint_path=resolved_checkpoint_path,
                 state=checkpoint_state,
-                metric_name="supcon",
-                metric_value=val_supcon_loss,
+                metric_name="knn",
+                metric_value=knn_acc,
                 epoch=epoch,
-                higher_is_better=False,
             )
 
     if saved_checkpoints:
         print("Saved top checkpoints:")
         for checkpoint in saved_checkpoints:
-            print(f"  epoch {checkpoint['epoch']:3d} | val SupCon {checkpoint['metric']:.4f} | {checkpoint['path']}")
+            print(f"  epoch {checkpoint['epoch']:3d} | k-NN acc {checkpoint['metric'] * 100:.2f}% | {checkpoint['path']}")
 
     if best_acc >= 0.0:
         print(f"Best k-NN accuracy: {best_acc * 100:.2f}%")

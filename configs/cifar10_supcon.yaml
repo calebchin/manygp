@@ -17,8 +17,8 @@ model:
   spec_norm_bound: 0.95
 
 training:
-  epochs: 100
-  eval_interval: 5
+  epochs: 200
+  eval_interval: 3
   log_every_steps: 20
   lr: 0.001
   weight_decay: 0.0001
@@ -28,7 +28,7 @@ training:
 
 output:
   checkpoint_path: ./checkpoints_supcon/cifar10_supcon_best.pt
-  top_k: 10
+  top_k: 3
 
 wandb:
   enabled: true
