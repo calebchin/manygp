@@ -1,6 +1,7 @@
 experiment:
   name: cifar10_supcon
   smoke_test: false
+  seed: 42
 
 data:
   root: ../datafolder/data

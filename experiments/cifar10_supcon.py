@@ -7,9 +7,11 @@ Usage:
 
 import argparse
 import os
+import random
 import sys
 from pathlib import Path
 
+import numpy as np
 import torch
 import yaml
 from tqdm.auto import tqdm
@@ -20,6 +22,16 @@ from src.data.cifar10 import get_cifar10_supcon_loaders
 from src.models.resnet import SupConResNet
 from src.training.contrastive import SupConLoss, evaluate_knn, train_supcon
 from src.utils.model_summary import print_model_summary
+
+
+def set_seed(seed: int) -> None:
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
 
 
 def update_topk_checkpoints(
@@ -60,6 +72,11 @@ def update_topk_checkpoints(
 
 def main(cfg: dict) -> None:
     smoke_test = cfg["experiment"]["smoke_test"]
+    seed = cfg["experiment"].get("seed")
+    if seed is not None:
+        set_seed(seed)
+        print(f"Seed: {seed}")
+
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Device: {device}")
 
@@ -209,9 +226,18 @@ def main(cfg: dict) -> None:
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="CIFAR-10 supervised contrastive experiment")
     parser.add_argument("--config", required=True, help="Path to YAML config file")
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=None,
+        help="Optional override for experiment.seed",
+    )
     args = parser.parse_args()
 
     with open(args.config) as f:
         cfg = yaml.safe_load(f)
+
+    if args.seed is not None:
+        cfg.setdefault("experiment", {})["seed"] = args.seed
 
     main(cfg)
