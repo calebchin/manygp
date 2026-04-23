@@ -20,7 +20,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from src.data.cifar10 import get_cifar10_supcon_loaders
 from src.models.resnet import SupConResNet
-from src.training.contrastive import SupConLoss, evaluate_knn, train_supcon
+from src.training.contrastive import SupConLoss, evaluate_knn, evaluate_supcon_loss, train_supcon
 from src.utils.model_summary import print_model_summary
 
 
@@ -93,13 +93,25 @@ def main(cfg: dict) -> None:
         )
 
     data_cfg = cfg["data"]
-    train_loader, memory_loader, val_loader, train_dataset, val_dataset = get_cifar10_supcon_loaders(
+    (
+        train_loader,
+        memory_loader,
+        val_loader,
+        val_supcon_loader,
+        train_dataset,
+        val_dataset,
+        val_supcon_dataset,
+    ) = get_cifar10_supcon_loaders(
         data_root=data_cfg["root"],
         batch_size=data_cfg["batch_size"],
         num_workers=data_cfg["num_workers"],
         smoke_test=smoke_test,
     )
-    print(f"Train size: {len(train_dataset)}, val size: {len(val_dataset)}")
+    print(
+        f"Train size: {len(train_dataset)}, "
+        f"val size: {len(val_dataset)}, "
+        f"val supcon size: {len(val_supcon_dataset)}"
+    )
 
     model_cfg = cfg["model"]
     model = SupConResNet(
@@ -151,8 +163,9 @@ def main(cfg: dict) -> None:
 
         should_evaluate = epoch % eval_interval == 0 or epoch == num_epochs
         knn_acc = None
+        val_supcon_loss = None
         if should_evaluate:
-            metrics = evaluate_knn(
+            knn_metrics = evaluate_knn(
                 model=model,
                 memory_loader=memory_loader,
                 val_loader=val_loader,
@@ -160,13 +173,25 @@ def main(cfg: dict) -> None:
                 k=train_cfg["knn_k"],
                 temperature=train_cfg["knn_temperature"],
             )
-            knn_acc = metrics["knn_accuracy"]
+            supcon_metrics = evaluate_supcon_loss(
+                model=model,
+                loader=val_supcon_loader,
+                loss_fn=loss_fn,
+                device=device,
+            )
+            knn_acc = knn_metrics["knn_accuracy"]
+            val_supcon_loss = supcon_metrics["supcon_loss"]
             print(
                 f"Epoch {epoch:3d}/{num_epochs} | "
                 f"SupCon Loss: {train_loss:.4f} | "
+                f"Val SupCon Loss: {val_supcon_loss:.4f} | "
                 f"k-NN Accuracy: {knn_acc * 100:.2f}%"
             )
-            epoch_progress.set_postfix(loss=f"{train_loss:.4f}", knn=f"{knn_acc * 100:.2f}%")
+            epoch_progress.set_postfix(
+                loss=f"{train_loss:.4f}",
+                val_loss=f"{val_supcon_loss:.4f}",
+                knn=f"{knn_acc * 100:.2f}%",
+            )
         else:
             print(f"Epoch {epoch:3d}/{num_epochs} | SupCon Loss: {train_loss:.4f}")
             epoch_progress.set_postfix(loss=f"{train_loss:.4f}")
@@ -179,6 +204,8 @@ def main(cfg: dict) -> None:
             }
             if knn_acc is not None:
                 log_data["eval/knn_accuracy"] = knn_acc
+            if val_supcon_loss is not None:
+                log_data["eval/supcon_loss"] = val_supcon_loss
             run.log(log_data)
 
         if knn_acc is None:
@@ -191,6 +218,7 @@ def main(cfg: dict) -> None:
                 "model_state_dict": model.state_dict(),
                 "optimizer_state_dict": optimizer.state_dict(),
                 "knn_accuracy": knn_acc,
+                "val_supcon_loss": val_supcon_loss,
                 "config": cfg,
             }
         if checkpoint_path:
