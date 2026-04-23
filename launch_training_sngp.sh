@@ -16,8 +16,8 @@ set -euo pipefail
 source /w/20252/wjcai/uq/manygp/venv/bin/activate
 cd /w/20252/wjcai/uq/manygp || exit 1
 
-TRAIN_DATASETS=(standard supcon_two_view)
-SEEDS=(42 43 44 45 46)
+TRAIN_DATASETS=(supcon_two_view)
+SEEDS=(43 44 45 46)
 
 num_train_datasets=${#TRAIN_DATASETS[@]}
 num_seeds=${#SEEDS[@]}
