@@ -146,6 +146,7 @@ class RandomFeatureGaussianProcess(nn.Module):
         input_normalization: str | None = None,
         kernel_scale: float = 1.0,
         length_scale: float = 1.0,
+        optimize_length_scale: bool = False,
     ):
         super().__init__()
         self.in_features = in_features
@@ -160,15 +161,27 @@ class RandomFeatureGaussianProcess(nn.Module):
             input_normalization if input_normalization is not None else ("layer_norm" if normalize_input else "none")
         )
         self.kernel_scale = kernel_scale
-        self.length_scale = length_scale
+        self.optimize_length_scale = optimize_length_scale
 
+        # For normalized_rbf: keep random_weight as N(0,I) and apply length scale
+        # dynamically in _random_features (matches GPyTorch RFFKernel._featurize pattern).
+        # For legacy: scale by 1/sqrt(d) at init as before.
         if kernel_type == "normalized_rbf":
-            random_weight = torch.randn(in_features, num_inducing) / max(length_scale, 1e-12)
+            random_weight = torch.randn(in_features, num_inducing)
         else:
             random_weight = torch.randn(in_features, num_inducing) / math.sqrt(in_features)
 
         self.register_buffer("random_weight", random_weight)
         self.register_buffer("random_bias", 2 * math.pi * torch.rand(num_inducing))
+
+        # log_length_scale: learnable parameter when optimize_length_scale=True, buffer otherwise.
+        # Stored in log-space so exp() always gives a positive value.
+        log_ls = torch.tensor(math.log(max(length_scale, 1e-12)))
+        if optimize_length_scale and kernel_type == "normalized_rbf":
+            self.log_length_scale = nn.Parameter(log_ls)
+        else:
+            self.register_buffer("log_length_scale", log_ls)
+
         self.beta = nn.Linear(num_inducing, out_features, bias=True)
         self.register_buffer(
             "precision_matrix",
@@ -193,7 +206,10 @@ class RandomFeatureGaussianProcess(nn.Module):
     def _random_features(self, x: torch.Tensor) -> torch.Tensor:
         x = self._normalize_features(x)
         if self.kernel_type == "normalized_rbf":
-            projection = x @ self.random_weight + self.random_bias
+            # Divide by length scale dynamically so gradients can flow through log_length_scale
+            # when optimize_length_scale=True. Mirrors GPyTorch RFFKernel._featurize().
+            l = self.log_length_scale.exp()
+            projection = x @ (self.random_weight / l) + self.random_bias
             return self.kernel_scale * math.sqrt(2.0 / self.num_inducing) * torch.cos(projection)
 
         projection = self.feature_scale * (x @ self.random_weight + self.random_bias)
@@ -212,6 +228,48 @@ class RandomFeatureGaussianProcess(nn.Module):
                 batch_precision,
                 alpha=(1.0 - self.gp_cov_momentum),
             )
+
+    def _compute_precision_grad(self, phi: torch.Tensor, logits: torch.Tensor) -> torch.Tensor:
+        """
+        Differentiable re-estimate of the precision matrix on the given batch.
+
+        Unlike _update_precision (which is @no_grad and accumulates into a buffer),
+        this version stays in the autograd graph so gradients can flow through it
+        to log_length_scale during the MML optimization step.
+
+        Returns shape: (out_features, num_inducing, num_inducing)
+        """
+        probs = logits.softmax(dim=-1)
+        prob_mult = probs * (1.0 - probs)
+        precision = torch.einsum("bk,bi,bj->kij", prob_mult, phi, phi)
+        eye = torch.eye(self.num_inducing, device=phi.device, dtype=phi.dtype).unsqueeze(0)
+        return precision + self.ridge_penalty * eye
+
+    def compute_laplace_log_mml(self, x: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
+        """
+        Laplace approximation to the log marginal likelihood w.r.t. log_length_scale.
+
+            log p(Y | X, l) ≈ log p(Y | θ_MAP) − ½ Σ_k log|P_k(l)|
+
+        Returns the *negative* log MML (scalar) so it can be minimized directly.
+        Gradients flow through log_length_scale via _random_features.
+        """
+        phi = self._random_features(x)   # differentiable w.r.t. log_length_scale
+        logits = self.beta(phi)
+
+        ce_term = -F.cross_entropy(logits, labels, reduction="sum")
+        precision = self._compute_precision_grad(phi, logits)  # [K, D, D]
+
+        # log|P_k| via Cholesky — numerically stable and differentiable
+        try:
+            L = torch.linalg.cholesky(precision)
+            log_det = 2.0 * L.diagonal(dim1=-2, dim2=-1).log().sum(dim=-1)  # [K]
+        except torch.linalg.LinAlgError:
+            sign, log_det = torch.linalg.slogdet(precision)
+            log_det = log_det * sign.clamp(min=0)
+
+        log_mml = ce_term - 0.5 * log_det.sum()
+        return -log_mml  # return negative for minimization
 
     def forward(
         self,
@@ -268,6 +326,11 @@ class SNGPResNetClassifier(nn.Module):
         feature_scale: float = 2.0,
         gp_cov_momentum: float = -1.0,
         normalize_input: bool = False,
+        kernel_type: str = "legacy",
+        input_normalization: str | None = None,
+        kernel_scale: float = 1.0,
+        length_scale: float = 1.0,
+        optimize_length_scale: bool = False,
     ):
         super().__init__()
         self.backbone = WideResNet28SNGPBackbone(
@@ -283,6 +346,11 @@ class SNGPResNetClassifier(nn.Module):
             feature_scale=feature_scale,
             gp_cov_momentum=gp_cov_momentum,
             normalize_input=normalize_input,
+            kernel_type=kernel_type,
+            input_normalization=input_normalization,
+            kernel_scale=kernel_scale,
+            length_scale=length_scale,
+            optimize_length_scale=optimize_length_scale,
         )
 
     def reset_precision_matrix(self) -> None:

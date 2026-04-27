@@ -1,0 +1,31 @@
+experiment:
+  name: cifar10_simclr_pretrain
+  smoke_test: false
+
+data:
+  root: ../datafolder/data
+  batch_size: 256
+  num_workers: 4
+
+model:
+  widen_factor: 10
+  embedding_dim: 128
+  proj_hidden_dim: 512
+  proj_out_dim: 128
+
+training:
+  epochs: 200
+  lr: 0.001
+  weight_decay: 1.0e-4
+  temperature: 0.5
+  log_every_steps: 50
+  knn_eval_interval: 10
+
+output:
+  checkpoint_path: ./checkpoints_simclr/cifar10_simclr_backbone.pt
+
+wandb:
+  enabled: true
+  project: sngp
+  entity: sta414manygp
+  run_name: simclr_pretrain_full

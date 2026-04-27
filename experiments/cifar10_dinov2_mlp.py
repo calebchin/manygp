@@ -1,31 +1,55 @@
 """
-CIFAR-10 SNGP training with a spectrally normalized Wide ResNet-28-10 backbone.
+CIFAR-10 DINOv2 frozen-backbone plain MLP baseline.
 
-After training, runs OOD detection (SVHN, CIFAR-100) and CIFAR-10-C corruption
-robustness evaluation in the same W&B run.
+Ablation counterpart to cifar10_dinov2_sngp.py. Uses the same frozen
+DINOv2 ViT-S/14 encoder but replaces the spectrally-normalized MLP + RFGP
+head with a plain MLP + softmax. All OOD metrics are identical so results
+are directly comparable.
 
 Usage:
-    python experiments/cifar10_sngp.py --config configs/cifar10_sngp.yaml
+    python experiments/cifar10_dinov2_mlp.py \
+        --config configs/experiment_april20_cifar10_dinov2_mlp.yaml
 """
 
 import argparse
-import itertools
 import os
 import sys
 from pathlib import Path
 
 import torch
+import torch.nn as nn
+import torch.nn.functional as F
 import yaml
 from tqdm.auto import tqdm
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from src.data.cifar10 import get_cifar10_loaders
-from src.models.sngp import SNGPResNetClassifier, laplace_predictive_probs
+from src.data.cifar10 import get_cifar10_dinov2_loaders
+from src.models.dinov2_encoder import DINOv2Encoder
 from src.training.evaluate import _classification_ece
 from src.training.ood_evaluate import collect_logits_and_probs
 from src.utils.model_loader import ModelWrapper
 from src.utils.model_summary import print_model_summary
+
+
+class DINOv2MLPClassifier(nn.Module):
+    def __init__(self, encoder: nn.Module, hidden_dims: list[int], num_classes: int, dropout_rate: float = 0.0):
+        super().__init__()
+        self.encoder = encoder
+        layers: list[nn.Module] = []
+        in_dim = encoder.output_dim
+        for h in hidden_dims:
+            layers += [nn.Linear(in_dim, h), nn.ReLU(inplace=True)]
+            if dropout_rate > 0:
+                layers.append(nn.Dropout(dropout_rate))
+            in_dim = h
+        layers.append(nn.Linear(in_dim, num_classes))
+        self.head = nn.Sequential(*layers)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        with torch.no_grad():
+            features = self.encoder(x)
+        return self.head(features)
 
 
 def update_topk_checkpoints(
@@ -67,16 +91,14 @@ def update_topk_checkpoints(
         worst_checkpoint["path"].unlink(missing_ok=True)
         saved_checkpoints.remove(worst_checkpoint)
 
-    # For lower_is_better: sort ascending so [0] is the lowest (best) value.
-    # For higher_is_better: sort descending so [0] is the highest (best) value.
     saved_checkpoints.sort(key=lambda item: item["metric"], reverse=not lower_is_better)
 
 
 def train_epoch(
-    model: torch.nn.Module,
+    model: nn.Module,
     loader,
     optimizer: torch.optim.Optimizer,
-    loss_fn: torch.nn.Module,
+    loss_fn: nn.Module,
     device: torch.device,
     epoch: int,
     show_progress: bool = True,
@@ -85,20 +107,17 @@ def train_epoch(
     global_step: int = 0,
 ) -> tuple[float, float, int]:
     model.train()
-    # NOTE: precision matrix reset is done once before the training loop starts,
-    # not here. With EMA momentum (gp_cov_momentum = 0.999) the precision carries
-    # over across epochs; resetting here would undo that accumulation.
     running_loss = 0.0
     total_correct = 0
     total_examples = 0
 
-    progress = tqdm(loader, desc=f"SNGP Epoch {epoch}", leave=False, disable=not show_progress)
+    progress = tqdm(loader, desc=f"DINOv2 MLP Epoch {epoch}", leave=False, disable=not show_progress)
     for images, labels in progress:
         images = images.to(device, non_blocking=True)
         labels = labels.to(device, non_blocking=True)
 
         optimizer.zero_grad(set_to_none=True)
-        logits = model(images, update_precision=True)
+        logits = model(images)
         loss = loss_fn(logits, labels)
         loss.backward()
         optimizer.step()
@@ -112,71 +131,20 @@ def train_epoch(
         if run is not None and log_every_steps is not None and log_every_steps > 0:
             if global_step % log_every_steps == 0:
                 run.log({
-                    "train/step_loss":    loss.item(),
-                    "train/global_step":  global_step,
-                    "train/epoch":        epoch,
-                    "train/lr_step":      optimizer.param_groups[0]["lr"],
+                    "train/step_loss":   loss.item(),
+                    "train/global_step": global_step,
+                    "train/epoch":       epoch,
+                    "train/lr_step":     optimizer.param_groups[0]["lr"],
                 })
 
     return running_loss / len(loader), total_correct / total_examples, global_step
 
 
-def mml_step(
-    model: torch.nn.Module,
-    gp_layer: torch.nn.Module,
-    mml_loader_iter,
-    mml_optimizer: torch.optim.Optimizer,
-    device: torch.device,
-    mml_steps: int = 1,
-) -> float:
-    """
-    Run mml_steps gradient updates on log_length_scale using the Laplace MML objective.
-
-    All model parameters except log_length_scale are frozen during this step.
-    Returns the mean MML loss over the steps.
-    """
-    for p in model.parameters():
-        p.requires_grad_(False)
-    gp_layer.log_length_scale.requires_grad_(True)
-
-    total_loss = 0.0
-    for _ in range(mml_steps):
-        images, labels = next(mml_loader_iter)
-        images, labels = images.to(device), labels.to(device)
-        mml_optimizer.zero_grad()
-        # Detach backbone features: gradient w.r.t. log_l comes through
-        # random_weight / exp(log_l), not through the features themselves.
-        with torch.no_grad():
-            features = model.encode(images)
-        loss = gp_layer.compute_laplace_log_mml(features, labels)
-        loss.backward()
-        mml_optimizer.step()
-        total_loss += loss.item()
-
-    for p in model.parameters():
-        p.requires_grad_(True)
-    return total_loss / mml_steps
-
-
-def rebuild_precision_matrix(
-    model: torch.nn.Module,
-    train_loader,
-    device: torch.device,
-) -> None:
-    """Reset and rebuild the precision matrix after a length scale update."""
-    model.reset_precision_matrix()
-    model.train()
-    with torch.no_grad():
-        for images, _ in train_loader:
-            model(images.to(device), update_precision=True)
-
-
 @torch.no_grad()
-def evaluate_sngp(
-    model: torch.nn.Module,
+def evaluate_mlp(
+    model: nn.Module,
     loader,
     device: torch.device,
-    num_mc_samples: int = 10,
 ) -> dict[str, float]:
     model.eval()
     running_loss = 0.0
@@ -186,13 +154,14 @@ def evaluate_sngp(
     all_probs: list[torch.Tensor] = []
     all_labels: list[torch.Tensor] = []
 
+    loss_fn = nn.CrossEntropyLoss()
     for images, labels in loader:
         images = images.to(device, non_blocking=True)
         labels = labels.to(device, non_blocking=True)
-        logits, variances = model(images, return_cov=True)
-        probs = laplace_predictive_probs(logits, variances, num_mc_samples=num_mc_samples)
+        logits = model(images)
+        loss = loss_fn(logits, labels)
+        probs = F.softmax(logits, dim=-1)
         log_probs = probs.clamp_min(1e-12).log()
-        loss = -log_probs.gather(1, labels.unsqueeze(1)).mean()
 
         running_loss += loss.item()
         total_correct += (probs.argmax(dim=1) == labels).sum().item()
@@ -241,36 +210,41 @@ def main(cfg: dict) -> None:
         )
 
     data_cfg = cfg["data"]
-    train_loader, val_loader, test_loader, train_dataset, val_dataset, test_dataset = get_cifar10_loaders(
-        data_root=data_cfg["root"],
-        batch_size=data_cfg["batch_size"],
-        num_workers=data_cfg["num_workers"],
-        smoke_test=smoke_test,
-    )
+    train_loader, val_loader, test_loader, train_dataset, val_dataset, test_dataset = \
+        get_cifar10_dinov2_loaders(
+            data_root=data_cfg["root"],
+            batch_size=data_cfg["batch_size"],
+            num_workers=data_cfg["num_workers"],
+            smoke_test=smoke_test,
+        )
     print(f"Train: {len(train_dataset)}  Val: {len(val_dataset)}  Test: {len(test_dataset)}")
 
+    backbone_cfg = cfg["backbone"]
+    frozen_encoder = DINOv2Encoder(
+        model_name=backbone_cfg.get("model_name", "dinov2_vits14"),
+        pretrained=backbone_cfg.get("pretrained", True),
+    ).to(device)
+    print(f"DINOv2 encoder output_dim: {frozen_encoder.output_dim}")
+
     model_cfg = cfg["model"]
-    model = SNGPResNetClassifier(
+    model = DINOv2MLPClassifier(
+        encoder=frozen_encoder,
+        hidden_dims=model_cfg["hidden_dims"],
         num_classes=model_cfg["num_classes"],
-        widen_factor=model_cfg.get("widen_factor", 10),
-        hidden_dim=model_cfg["hidden_dim"],
-        spec_norm_bound=model_cfg["spec_norm_bound"],
-        num_inducing=model_cfg["num_inducing"],
-        ridge_penalty=model_cfg["ridge_penalty"],
-        feature_scale=model_cfg["feature_scale"],
-        gp_cov_momentum=model_cfg["gp_cov_momentum"],
-        normalize_input=model_cfg["normalize_input"],
-        kernel_type=model_cfg.get("kernel_type", "legacy"),
-        input_normalization=model_cfg.get("input_normalization", None),
-        kernel_scale=model_cfg.get("kernel_scale", 1.0),
-        length_scale=model_cfg.get("length_scale", 1.0),
-        optimize_length_scale=model_cfg.get("optimize_length_scale", False),
+        dropout_rate=model_cfg.get("dropout_rate", 0.0),
     ).to(device)
     print_model_summary(model)
 
+    with torch.no_grad():
+        dummy = torch.randn(2, 3, 224, 224, device=device)
+        _logits = model(dummy)
+        assert _logits.shape == (2, model_cfg["num_classes"]), f"Unexpected logit shape: {_logits.shape}"
+        print("Forward pass shape check passed.")
+    del dummy, _logits
+
     train_cfg = cfg["training"]
     optimizer = torch.optim.Adam(
-        model.parameters(),
+        [p for p in model.parameters() if p.requires_grad],
         lr=train_cfg["lr"],
         weight_decay=train_cfg["weight_decay"],
     )
@@ -278,13 +252,12 @@ def main(cfg: dict) -> None:
         optimizer,
         T_max=1 if smoke_test else train_cfg["epochs"],
     )
-    loss_fn = torch.nn.CrossEntropyLoss()
+    loss_fn = nn.CrossEntropyLoss()
 
     best_acc = -1.0
     num_epochs = 1 if smoke_test else train_cfg["epochs"]
     eval_interval = 1 if smoke_test else train_cfg.get("eval_interval", 1)
     log_every_steps = train_cfg.get("log_every_steps", None)
-    num_mc_samples = train_cfg.get("num_mc_samples", 10)
     output_cfg = cfg.get("output", {})
     checkpoint_path = output_cfg.get("checkpoint_path")
     top_k = output_cfg.get("top_k", 1)
@@ -292,28 +265,6 @@ def main(cfg: dict) -> None:
     lower_is_better = checkpoint_metric in ("val_ece", "val_loss")
     saved_checkpoints: list[dict] = []
     global_step = 0
-
-    # MML optimizer setup (only active when optimize_length_scale=True in model config)
-    mml_cfg = cfg.get("mml", {})
-    mml_enabled = (
-        mml_cfg.get("enabled", False)
-        and model_cfg.get("optimize_length_scale", False)
-        and not smoke_test
-    )
-    mml_optimizer = None
-    mml_loader_iter = None
-    mml_interval = mml_cfg.get("interval_epochs", 1)
-    mml_steps_per_interval = mml_cfg.get("steps_per_interval", 5)
-    if mml_enabled:
-        mml_optimizer = torch.optim.Adam(
-            [model.classifier.log_length_scale],
-            lr=mml_cfg.get("lr", 1e-3),
-        )
-        mml_loader_iter = iter(itertools.cycle(val_loader))
-
-    # Single precision-matrix reset before training begins (not per-epoch).
-    # The EMA update (gp_cov_momentum = 0.999) accumulates across all epochs.
-    model.reset_precision_matrix()
 
     epoch_progress = tqdm(range(1, num_epochs + 1), desc="Epoch", leave=True)
     for epoch in epoch_progress:
@@ -324,25 +275,10 @@ def main(cfg: dict) -> None:
         )
         scheduler.step()
 
-        if mml_enabled and epoch % mml_interval == 0:
-            mml_loss = mml_step(
-                model=model,
-                gp_layer=model.classifier,
-                mml_loader_iter=mml_loader_iter,
-                mml_optimizer=mml_optimizer,
-                device=device,
-                mml_steps=mml_steps_per_interval,
-            )
-            current_ls = model.classifier.log_length_scale.exp().item()
-            # Rebuild precision matrix under the updated length scale
-            rebuild_precision_matrix(model, train_loader, device)
-            if run is not None:
-                run.log({"mml/loss": mml_loss, "mml/length_scale": current_ls, "train/epoch": epoch})
-
         should_evaluate = epoch % eval_interval == 0 or epoch == num_epochs
         val_loss = val_acc = val_nll = val_ece = None
         if should_evaluate:
-            metrics = evaluate_sngp(model=model, loader=val_loader, device=device, num_mc_samples=num_mc_samples)
+            metrics = evaluate_mlp(model=model, loader=val_loader, device=device)
             val_loss, val_acc, val_nll, val_ece = (
                 metrics["loss"], metrics["accuracy"], metrics["nll"], metrics["ece"]
             )
@@ -381,7 +317,6 @@ def main(cfg: dict) -> None:
             "optimizer_state_dict": optimizer.state_dict(),
             "val_accuracy": val_acc, "val_loss": val_loss, "val_nll": val_nll, "val_ece": val_ece,
             "config": cfg,
-            "log_length_scale": model.classifier.log_length_scale.item(),
         }
         if checkpoint_path:
             _metric_map = {"val_ece": val_ece, "val_loss": val_loss, "val_accuracy": val_acc}
@@ -396,7 +331,7 @@ def main(cfg: dict) -> None:
     if best_acc >= 0.0:
         print(f"Best validation accuracy: {best_acc * 100:.2f}%")
 
-    # ── Test evaluation + OOD/CIFAR-C (same W&B run) ─────────────────────────
+    # ── Test evaluation + OOD/CIFAR-C ────────────────────────────────────────
     test_metrics: dict[str, float] | None = None
     if saved_checkpoints:
         import shutil
@@ -407,7 +342,7 @@ def main(cfg: dict) -> None:
         print(f"Best model saved to: {best_model_path}")
 
         print("\nEvaluating best checkpoint on held-out test set...")
-        test_metrics = evaluate_sngp(model, test_loader, device, num_mc_samples)
+        test_metrics = evaluate_mlp(model, test_loader, device)
         print(
             f"Test Acc: {test_metrics['accuracy'] * 100:.2f}% | "
             f"Test NLL: {test_metrics['nll']:.4f} | "
@@ -422,15 +357,14 @@ def main(cfg: dict) -> None:
                 "test/loss":     test_metrics["loss"],
             })
 
-        # Collect test-set logits/probs for OOD baseline (reuse inference)
         if not smoke_test and cfg.get("ood", {}).get("enabled", True):
             print("\nRunning OOD + CIFAR-C evaluation...")
             from src.training.post_training_eval import run_full_ood_eval
-            wrapper = ModelWrapper(model=model, has_cov=True, num_mc_samples=num_mc_samples, model_type="sngp")
-            id_logits, id_probs, _, _ = collect_logits_and_probs(wrapper, test_loader, device, num_mc_samples)
+            wrapper = ModelWrapper(model=model, has_cov=False, num_mc_samples=1, model_type="plain")
+            id_logits, id_probs, _, _ = collect_logits_and_probs(wrapper, test_loader, device, num_mc_samples=1)
             run_full_ood_eval(
-                model=model, has_cov=True, id_logits=id_logits, id_probs=id_probs,
-                cfg=cfg, device=device, run=run, num_mc_samples=num_mc_samples, model_type="sngp",
+                model=model, has_cov=False, id_logits=id_logits, id_probs=id_probs,
+                cfg=cfg, device=device, run=run, num_mc_samples=1, model_type="plain",
             )
 
     if run is not None:
@@ -439,14 +373,14 @@ def main(cfg: dict) -> None:
         if saved_checkpoints:
             run.log({f"best/{checkpoint_metric}": saved_checkpoints[0]["metric"]})
             import wandb
-            artifact = wandb.Artifact("cifar10_sngp_best_model", type="model")
+            artifact = wandb.Artifact("cifar10_dinov2_mlp_best_model", type="model")
             artifact.add_file(str(saved_checkpoints[0]["path"]), name=saved_checkpoints[0]["path"].name)
             run.log_artifact(artifact)
         run.finish()
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="CIFAR-10 SNGP experiment")
+    parser = argparse.ArgumentParser(description="CIFAR-10 DINOv2 frozen-backbone plain MLP baseline")
     parser.add_argument("--config", required=True, help="Path to YAML config file")
     parser.add_argument("--seed", type=int, default=None, help="Random seed (overrides config)")
     parser.add_argument("--run-name", type=str, default=None, dest="run_name",

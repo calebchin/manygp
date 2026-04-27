@@ -31,6 +31,7 @@ class CifarResNetSupConSNGPClassifier(nn.Module):
         input_normalization: str = "l2",
         kernel_scale: float = 1.0,
         length_scale: float = 1.0,
+        optimize_length_scale: bool = False,
     ):
         super().__init__()
         self.encoder = CifarResNetEncoder(widen_factor=widen_factor, embedding_dim=embedding_dim)
@@ -57,6 +58,7 @@ class CifarResNetSupConSNGPClassifier(nn.Module):
             input_normalization=input_normalization,
             kernel_scale=kernel_scale,
             length_scale=length_scale,
+            optimize_length_scale=optimize_length_scale,
         )
 
     def reset_precision_matrix(self) -> None:

@@ -1,15 +1,16 @@
 """
-CIFAR-10 SNGP training with a spectrally normalized Wide ResNet-28-10 backbone.
+CIFAR-10 frozen-backbone SNGP training.
 
-After training, runs OOD detection (SVHN, CIFAR-100) and CIFAR-10-C corruption
-robustness evaluation in the same W&B run.
+Loads a pretrained ResNet encoder from a checkpoint, freezes it, and trains a
+configurable shallow SNGP head on top. Matches the evaluation suite of
+cifar10_sngp.py: val/test split, ECE, OOD detection (SVHN, CIFAR-100), and
+CIFAR-10-C corruption robustness — all in the same W&B run.
 
 Usage:
-    python experiments/cifar10_sngp.py --config configs/cifar10_sngp.yaml
+    python experiments/cifar10_frozen_backbone_sngp.py --config configs/cifar10_frozen_backbone_sngp.yaml
 """
 
 import argparse
-import itertools
 import os
 import sys
 from pathlib import Path
@@ -21,7 +22,9 @@ from tqdm.auto import tqdm
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from src.data.cifar10 import get_cifar10_loaders
-from src.models.sngp import SNGPResNetClassifier, laplace_predictive_probs
+from src.models.frozen_sngp import FrozenBackboneSNGPClassifier
+from src.models.simclr import load_simclr_backbone
+from src.models.sngp import laplace_predictive_probs
 from src.training.evaluate import _classification_ece
 from src.training.ood_evaluate import collect_logits_and_probs
 from src.utils.model_loader import ModelWrapper
@@ -67,8 +70,6 @@ def update_topk_checkpoints(
         worst_checkpoint["path"].unlink(missing_ok=True)
         saved_checkpoints.remove(worst_checkpoint)
 
-    # For lower_is_better: sort ascending so [0] is the lowest (best) value.
-    # For higher_is_better: sort descending so [0] is the highest (best) value.
     saved_checkpoints.sort(key=lambda item: item["metric"], reverse=not lower_is_better)
 
 
@@ -85,14 +86,11 @@ def train_epoch(
     global_step: int = 0,
 ) -> tuple[float, float, int]:
     model.train()
-    # NOTE: precision matrix reset is done once before the training loop starts,
-    # not here. With EMA momentum (gp_cov_momentum = 0.999) the precision carries
-    # over across epochs; resetting here would undo that accumulation.
     running_loss = 0.0
     total_correct = 0
     total_examples = 0
 
-    progress = tqdm(loader, desc=f"SNGP Epoch {epoch}", leave=False, disable=not show_progress)
+    progress = tqdm(loader, desc=f"Frozen SNGP Epoch {epoch}", leave=False, disable=not show_progress)
     for images, labels in progress:
         images = images.to(device, non_blocking=True)
         labels = labels.to(device, non_blocking=True)
@@ -112,63 +110,13 @@ def train_epoch(
         if run is not None and log_every_steps is not None and log_every_steps > 0:
             if global_step % log_every_steps == 0:
                 run.log({
-                    "train/step_loss":    loss.item(),
-                    "train/global_step":  global_step,
-                    "train/epoch":        epoch,
-                    "train/lr_step":      optimizer.param_groups[0]["lr"],
+                    "train/step_loss":   loss.item(),
+                    "train/global_step": global_step,
+                    "train/epoch":       epoch,
+                    "train/lr_step":     optimizer.param_groups[0]["lr"],
                 })
 
     return running_loss / len(loader), total_correct / total_examples, global_step
-
-
-def mml_step(
-    model: torch.nn.Module,
-    gp_layer: torch.nn.Module,
-    mml_loader_iter,
-    mml_optimizer: torch.optim.Optimizer,
-    device: torch.device,
-    mml_steps: int = 1,
-) -> float:
-    """
-    Run mml_steps gradient updates on log_length_scale using the Laplace MML objective.
-
-    All model parameters except log_length_scale are frozen during this step.
-    Returns the mean MML loss over the steps.
-    """
-    for p in model.parameters():
-        p.requires_grad_(False)
-    gp_layer.log_length_scale.requires_grad_(True)
-
-    total_loss = 0.0
-    for _ in range(mml_steps):
-        images, labels = next(mml_loader_iter)
-        images, labels = images.to(device), labels.to(device)
-        mml_optimizer.zero_grad()
-        # Detach backbone features: gradient w.r.t. log_l comes through
-        # random_weight / exp(log_l), not through the features themselves.
-        with torch.no_grad():
-            features = model.encode(images)
-        loss = gp_layer.compute_laplace_log_mml(features, labels)
-        loss.backward()
-        mml_optimizer.step()
-        total_loss += loss.item()
-
-    for p in model.parameters():
-        p.requires_grad_(True)
-    return total_loss / mml_steps
-
-
-def rebuild_precision_matrix(
-    model: torch.nn.Module,
-    train_loader,
-    device: torch.device,
-) -> None:
-    """Reset and rebuild the precision matrix after a length scale update."""
-    model.reset_precision_matrix()
-    model.train()
-    with torch.no_grad():
-        for images, _ in train_loader:
-            model(images.to(device), update_precision=True)
 
 
 @torch.no_grad()
@@ -249,28 +197,36 @@ def main(cfg: dict) -> None:
     )
     print(f"Train: {len(train_dataset)}  Val: {len(val_dataset)}  Test: {len(test_dataset)}")
 
+    backbone_cfg = cfg["backbone"]
+    frozen_encoder = load_simclr_backbone(
+        checkpoint_path=backbone_cfg["checkpoint_path"],
+        widen_factor=backbone_cfg["widen_factor"],
+        embedding_dim=backbone_cfg["embedding_dim"],
+        device=device,
+    )
+
     model_cfg = cfg["model"]
-    model = SNGPResNetClassifier(
+    model = FrozenBackboneSNGPClassifier(
+        encoder=frozen_encoder,
         num_classes=model_cfg["num_classes"],
-        widen_factor=model_cfg.get("widen_factor", 10),
-        hidden_dim=model_cfg["hidden_dim"],
+        hidden_dims=model_cfg["hidden_dims"],
         spec_norm_bound=model_cfg["spec_norm_bound"],
+        dropout_rate=model_cfg.get("dropout_rate", 0.0),
         num_inducing=model_cfg["num_inducing"],
         ridge_penalty=model_cfg["ridge_penalty"],
         feature_scale=model_cfg["feature_scale"],
         gp_cov_momentum=model_cfg["gp_cov_momentum"],
         normalize_input=model_cfg["normalize_input"],
-        kernel_type=model_cfg.get("kernel_type", "legacy"),
-        input_normalization=model_cfg.get("input_normalization", None),
+        kernel_type=model_cfg.get("kernel_type", "normalized_rbf"),
+        input_normalization=model_cfg.get("input_normalization", "l2"),
         kernel_scale=model_cfg.get("kernel_scale", 1.0),
         length_scale=model_cfg.get("length_scale", 1.0),
-        optimize_length_scale=model_cfg.get("optimize_length_scale", False),
     ).to(device)
     print_model_summary(model)
 
     train_cfg = cfg["training"]
     optimizer = torch.optim.Adam(
-        model.parameters(),
+        [p for p in model.parameters() if p.requires_grad],
         lr=train_cfg["lr"],
         weight_decay=train_cfg["weight_decay"],
     )
@@ -293,26 +249,6 @@ def main(cfg: dict) -> None:
     saved_checkpoints: list[dict] = []
     global_step = 0
 
-    # MML optimizer setup (only active when optimize_length_scale=True in model config)
-    mml_cfg = cfg.get("mml", {})
-    mml_enabled = (
-        mml_cfg.get("enabled", False)
-        and model_cfg.get("optimize_length_scale", False)
-        and not smoke_test
-    )
-    mml_optimizer = None
-    mml_loader_iter = None
-    mml_interval = mml_cfg.get("interval_epochs", 1)
-    mml_steps_per_interval = mml_cfg.get("steps_per_interval", 5)
-    if mml_enabled:
-        mml_optimizer = torch.optim.Adam(
-            [model.classifier.log_length_scale],
-            lr=mml_cfg.get("lr", 1e-3),
-        )
-        mml_loader_iter = iter(itertools.cycle(val_loader))
-
-    # Single precision-matrix reset before training begins (not per-epoch).
-    # The EMA update (gp_cov_momentum = 0.999) accumulates across all epochs.
     model.reset_precision_matrix()
 
     epoch_progress = tqdm(range(1, num_epochs + 1), desc="Epoch", leave=True)
@@ -323,21 +259,6 @@ def main(cfg: dict) -> None:
             log_every_steps=log_every_steps, global_step=global_step,
         )
         scheduler.step()
-
-        if mml_enabled and epoch % mml_interval == 0:
-            mml_loss = mml_step(
-                model=model,
-                gp_layer=model.classifier,
-                mml_loader_iter=mml_loader_iter,
-                mml_optimizer=mml_optimizer,
-                device=device,
-                mml_steps=mml_steps_per_interval,
-            )
-            current_ls = model.classifier.log_length_scale.exp().item()
-            # Rebuild precision matrix under the updated length scale
-            rebuild_precision_matrix(model, train_loader, device)
-            if run is not None:
-                run.log({"mml/loss": mml_loss, "mml/length_scale": current_ls, "train/epoch": epoch})
 
         should_evaluate = epoch % eval_interval == 0 or epoch == num_epochs
         val_loss = val_acc = val_nll = val_ece = None
@@ -381,7 +302,6 @@ def main(cfg: dict) -> None:
             "optimizer_state_dict": optimizer.state_dict(),
             "val_accuracy": val_acc, "val_loss": val_loss, "val_nll": val_nll, "val_ece": val_ece,
             "config": cfg,
-            "log_length_scale": model.classifier.log_length_scale.item(),
         }
         if checkpoint_path:
             _metric_map = {"val_ece": val_ece, "val_loss": val_loss, "val_accuracy": val_acc}
@@ -422,7 +342,6 @@ def main(cfg: dict) -> None:
                 "test/loss":     test_metrics["loss"],
             })
 
-        # Collect test-set logits/probs for OOD baseline (reuse inference)
         if not smoke_test and cfg.get("ood", {}).get("enabled", True):
             print("\nRunning OOD + CIFAR-C evaluation...")
             from src.training.post_training_eval import run_full_ood_eval
@@ -439,14 +358,14 @@ def main(cfg: dict) -> None:
         if saved_checkpoints:
             run.log({f"best/{checkpoint_metric}": saved_checkpoints[0]["metric"]})
             import wandb
-            artifact = wandb.Artifact("cifar10_sngp_best_model", type="model")
+            artifact = wandb.Artifact("cifar10_frozen_backbone_sngp_best_model", type="model")
             artifact.add_file(str(saved_checkpoints[0]["path"]), name=saved_checkpoints[0]["path"].name)
             run.log_artifact(artifact)
         run.finish()
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="CIFAR-10 SNGP experiment")
+    parser = argparse.ArgumentParser(description="CIFAR-10 frozen-backbone SNGP experiment")
     parser.add_argument("--config", required=True, help="Path to YAML config file")
     parser.add_argument("--seed", type=int, default=None, help="Random seed (overrides config)")
     parser.add_argument("--run-name", type=str, default=None, dest="run_name",

@@ -133,6 +133,7 @@ def run_full_ood_eval(
 
     all_accuracies: list[float] = []
     all_eces: list[float] = []
+    all_nlls: list[float] = []
 
     from tqdm.auto import tqdm
     for corruption in tqdm(corruptions_to_eval, desc="CIFAR-C Corruptions"):
@@ -152,27 +153,33 @@ def run_full_ood_eval(
 
             all_accuracies.append(split_metrics["accuracy"])
             all_eces.append(split_metrics["ece"])
+            all_nlls.append(split_metrics["nll"])
 
             if run is not None:
                 run.log({
                     f"cifarc/{corruption}/severity_{severity}/accuracy": split_metrics["accuracy"],
                     f"cifarc/{corruption}/severity_{severity}/ece":      split_metrics["ece"],
                     f"cifarc/{corruption}/severity_{severity}/mce":      split_metrics["mce"],
+                    f"cifarc/{corruption}/severity_{severity}/nll":      split_metrics["nll"],
                 })
 
     # Aggregate over all corruptions × severities (matches "Corrupted" column in paper)
     mean_corrupted_acc = sum(all_accuracies) / len(all_accuracies) if all_accuracies else 0.0
     mean_corrupted_ece = sum(all_eces) / len(all_eces) if all_eces else 0.0
+    mean_corrupted_nll = sum(all_nlls) / len(all_nlls) if all_nlls else 0.0
     results["cifarc"]["mean_accuracy"] = mean_corrupted_acc
     results["cifarc"]["mean_ece"] = mean_corrupted_ece
+    results["cifarc"]["mean_nll"] = mean_corrupted_nll
 
     print(f"\n  Mean corrupted accuracy: {mean_corrupted_acc * 100:.2f}%")
     print(f"  Mean corrupted ECE:      {mean_corrupted_ece:.4f}")
+    print(f"  Mean corrupted NLL:      {mean_corrupted_nll:.4f}")
 
     if run is not None:
         run.log({
             "test/corrupted_accuracy": mean_corrupted_acc,
             "test/corrupted_ece":      mean_corrupted_ece,
+            "test/corrupted_nll":      mean_corrupted_nll,
         })
 
     return results

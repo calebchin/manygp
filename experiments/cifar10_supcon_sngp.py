@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import argparse
 import copy
+import itertools
 import os
 import sys
 from datetime import datetime
@@ -154,6 +155,58 @@ def train_epoch(
     }, global_step
 
 
+def mml_step(
+    model: torch.nn.Module,
+    gp_layer: torch.nn.Module,
+    mml_loader_iter,
+    mml_optimizer: torch.optim.Optimizer,
+    device: torch.device,
+    mml_steps: int = 1,
+) -> float:
+    """
+    Run mml_steps gradient updates on log_length_scale using the Laplace MML objective.
+
+    All model parameters except log_length_scale are frozen during this step.
+    Returns the mean MML loss over the steps.
+    """
+    for p in model.parameters():
+        p.requires_grad_(False)
+    gp_layer.log_length_scale.requires_grad_(True)
+
+    total_loss = 0.0
+    for _ in range(mml_steps):
+        images, labels = next(mml_loader_iter)
+        images, labels = images.to(device), labels.to(device)
+        mml_optimizer.zero_grad()
+        # Detach backbone features: gradient w.r.t. log_l comes through
+        # random_weight / exp(log_l), not through the features themselves.
+        with torch.no_grad():
+            features = model.encode(images)
+        loss = gp_layer.compute_laplace_log_mml(features, labels)
+        loss.backward()
+        mml_optimizer.step()
+        total_loss += loss.item()
+
+    for p in model.parameters():
+        p.requires_grad_(True)
+    return total_loss / mml_steps
+
+
+def rebuild_precision_matrix(
+    model: torch.nn.Module,
+    train_loader,
+    device: torch.device,
+) -> None:
+    """Reset and rebuild the precision matrix after a length scale update."""
+    model.reset_precision_matrix()
+    model.train()
+    with torch.no_grad():
+        for views, labels in train_loader:
+            batch_size, num_views, channels, height, width = views.shape
+            views = views.to(device).view(batch_size * num_views, channels, height, width)
+            model(views, update_precision=True)
+
+
 @torch.no_grad()
 def evaluate_joint_sngp(
     model: torch.nn.Module,
@@ -249,6 +302,7 @@ def main(cfg: dict) -> None:
         input_normalization=model_cfg["input_normalization"],
         kernel_scale=model_cfg["kernel_scale"],
         length_scale=model_cfg["length_scale"],
+        optimize_length_scale=model_cfg.get("optimize_length_scale", False),
     ).to(device)
     print_model_summary(model)
 
@@ -281,6 +335,24 @@ def main(cfg: dict) -> None:
     saved_checkpoints: list[dict] = []
     global_step = 0
 
+    # MML optimizer setup (only active when optimize_length_scale=True in model config)
+    mml_cfg = cfg.get("mml", {})
+    mml_enabled = (
+        mml_cfg.get("enabled", False)
+        and model_cfg.get("optimize_length_scale", False)
+        and not smoke_test
+    )
+    mml_optimizer = None
+    mml_loader_iter = None
+    mml_interval = mml_cfg.get("interval_epochs", 1)
+    mml_steps_per_interval = mml_cfg.get("steps_per_interval", 5)
+    if mml_enabled:
+        mml_optimizer = torch.optim.Adam(
+            [model.classifier.log_length_scale],
+            lr=mml_cfg.get("lr", 1e-3),
+        )
+        mml_loader_iter = iter(itertools.cycle(val_loader))
+
     # Single precision-matrix reset before training begins (not per-epoch).
     model.reset_precision_matrix()
 
@@ -296,6 +368,21 @@ def main(cfg: dict) -> None:
             show_progress=True, run=run, log_every_steps=log_every_steps, global_step=global_step,
         )
         scheduler.step()
+
+        if mml_enabled and epoch % mml_interval == 0:
+            mml_loss = mml_step(
+                model=model,
+                gp_layer=model.classifier,
+                mml_loader_iter=mml_loader_iter,
+                mml_optimizer=mml_optimizer,
+                device=device,
+                mml_steps=mml_steps_per_interval,
+            )
+            current_ls = model.classifier.log_length_scale.exp().item()
+            # Rebuild precision matrix under the updated length scale
+            rebuild_precision_matrix(model, train_loader, device)
+            if run is not None:
+                run.log({"mml/loss": mml_loss, "mml/length_scale": current_ls, "train/epoch": epoch})
 
         should_evaluate = epoch % eval_interval == 0 or epoch == num_epochs
         val_metrics = None
@@ -352,6 +439,7 @@ def main(cfg: dict) -> None:
             "train_metrics": train_metrics,
             "val_metrics": val_metrics,
             "config": runtime_cfg,
+            "log_length_scale": model.classifier.log_length_scale.item(),
         }
         if resolved_checkpoint_path:
             _metric_map = {"val_ece": val_metrics["ece"], "val_loss": val_metrics["loss"], "val_accuracy": val_metrics["accuracy"]}

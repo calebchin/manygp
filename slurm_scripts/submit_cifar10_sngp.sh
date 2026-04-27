@@ -5,7 +5,7 @@
 #SBATCH --constraint="RTX_4090|RTX_A6000"
 #SBATCH -c 8
 #SBATCH --mem=32G
-#SBATCH --time=6:00:00
+#SBATCH --time=7:00:00
 #SBATCH --output=/w/20252/davida/manygp_logs/%j.out
 #SBATCH --error=/w/20252/davida/manygp_logs/%j.err
 
@@ -14,16 +14,17 @@
 # Example:
 #   sbatch submit_cifar10_sngp.sh 0 sngp_seed0
 
-REPO=/w/20252/davida/manygp/manygp
 SEED=${1:-""}
 RUN_NAME=${2:-""}
 
-mkdir -p /w/20252/davida/manygp_logs
+REPO=/w/20251/cchin/manygp/manygp
+
 cd $REPO
+mkdir -p $REPO/logs
 
-source /w/20252/davida/venv/bin/activate
+source $REPO/.venv/bin/activate
 
-export WANDB_API_KEY=$(cat /w/20252/davida/.wandb_api_key)
+#export WANDB_API_KEY=$(cat /w/20252/davida/.wandb_api_key)
 export CUDA_LAUNCH_BLOCKING=1
 
 echo "Running CIFAR-10 SNGP | seed=${SEED:-none} | run=${RUN_NAME:-default}"

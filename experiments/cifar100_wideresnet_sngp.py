@@ -1,17 +1,23 @@
 """
-CIFAR-100 SNGP training with a spectrally normalized ResNet backbone.
+CIFAR-100 SNGP training with a Wide ResNet-28-10 spectrally normalized backbone.
+
+Supports multi-seed experiments via --seed and --run-name arguments.
 
 Usage:
-    python experiments/cifar100_sngp.py --config configs/cifar100_sngp.yaml
+    python experiments/cifar100_wideresnet_sngp.py \
+        --config configs/experiment_april6_cifar100_sngp.yaml \
+        --seed 0 \
+        --run-name cifar100_sngp_seed0
 """
 
 import argparse
-import itertools
 import math
 import os
+import random
 import sys
 from pathlib import Path
 
+import numpy as np
 import torch
 import yaml
 from tqdm.auto import tqdm
@@ -20,6 +26,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from src.data.cifar100 import get_cifar100_loaders
 from src.models.sngp import SNGPResNetClassifier, laplace_predictive_probs
+from src.training.evaluate import _classification_ece
 from src.utils.model_summary import print_model_summary
 
 
@@ -118,6 +125,8 @@ def evaluate_sngp(
     total_correct = 0
     total_examples = 0
     total_nll = 0.0
+    all_probs = []
+    all_labels = []
 
     for images, labels in loader:
         images = images.to(device, non_blocking=True)
@@ -131,68 +140,34 @@ def evaluate_sngp(
         total_correct += (probs.argmax(dim=1) == labels).sum().item()
         total_examples += labels.size(0)
         total_nll += -log_probs.gather(1, labels.unsqueeze(1)).sum().item()
+        all_probs.append(probs.cpu())
+        all_labels.append(labels.cpu())
+
+    all_probs = torch.cat(all_probs, dim=0)
+    all_labels = torch.cat(all_labels, dim=0)
+    ece = _classification_ece(all_probs, all_labels)
 
     return {
         "loss": running_loss / len(loader),
         "accuracy": total_correct / total_examples,
         "nll": total_nll / total_examples,
+        "ece": ece,
     }
-
-
-def mml_step(
-    model: torch.nn.Module,
-    gp_layer: torch.nn.Module,
-    mml_loader_iter,
-    mml_optimizer: torch.optim.Optimizer,
-    device: torch.device,
-    mml_steps: int = 1,
-) -> float:
-    """
-    Run mml_steps gradient updates on log_length_scale using the Laplace MML objective.
-
-    All model parameters except log_length_scale are frozen during this step.
-    Returns the mean MML loss over the steps.
-    """
-    for p in model.parameters():
-        p.requires_grad_(False)
-    gp_layer.log_length_scale.requires_grad_(True)
-
-    total_loss = 0.0
-    for _ in range(mml_steps):
-        images, labels = next(mml_loader_iter)
-        images, labels = images.to(device), labels.to(device)
-        mml_optimizer.zero_grad()
-        # Detach backbone features: gradient w.r.t. log_l comes through
-        # random_weight / exp(log_l), not through the features themselves.
-        with torch.no_grad():
-            features = model.encode(images)
-        loss = gp_layer.compute_laplace_log_mml(features, labels)
-        loss.backward()
-        mml_optimizer.step()
-        total_loss += loss.item()
-
-    for p in model.parameters():
-        p.requires_grad_(True)
-    return total_loss / mml_steps
-
-
-def rebuild_precision_matrix(
-    model: torch.nn.Module,
-    train_loader,
-    device: torch.device,
-) -> None:
-    """Reset and rebuild the precision matrix after a length scale update."""
-    model.reset_precision_matrix()
-    model.train()
-    with torch.no_grad():
-        for images, _ in train_loader:
-            model(images.to(device), update_precision=True)
 
 
 def main(cfg: dict) -> None:
     smoke_test = cfg["experiment"]["smoke_test"]
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Device: {device}")
+
+    seed = cfg.get("training", {}).get("seed", None)
+    if seed is not None:
+        random.seed(seed)
+        np.random.seed(seed)
+        torch.manual_seed(seed)
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed_all(seed)
+        print(f"Random seed: {seed}")
 
     run = None
     wandb_cfg = cfg.get("wandb", {})
@@ -218,7 +193,7 @@ def main(cfg: dict) -> None:
     model_cfg = cfg["model"]
     model = SNGPResNetClassifier(
         num_classes=model_cfg["num_classes"],
-        width=model_cfg["width"],
+        widen_factor=model_cfg.get("widen_factor", 10),
         hidden_dim=model_cfg["hidden_dim"],
         spec_norm_bound=model_cfg["spec_norm_bound"],
         num_inducing=model_cfg["num_inducing"],
@@ -228,6 +203,7 @@ def main(cfg: dict) -> None:
         normalize_input=model_cfg["normalize_input"],
     ).to(device)
     print_model_summary(model)
+
     train_cfg = cfg["training"]
     optimizer = torch.optim.Adam(
         model.parameters(),
@@ -241,32 +217,14 @@ def main(cfg: dict) -> None:
     loss_fn = torch.nn.CrossEntropyLoss()
     best_acc = -1.0
     num_epochs = 1 if smoke_test else train_cfg["epochs"]
-    eval_interval = 1 if smoke_test else train_cfg.get("eval_interval", 1)
+    eval_interval = 1 if smoke_test else train_cfg.get("eval_interval", 5)
     log_every_steps = train_cfg.get("log_every_steps", None)
     num_mc_samples = train_cfg.get("num_mc_samples", 10)
     output_cfg = cfg.get("output", {})
     checkpoint_path = output_cfg.get("checkpoint_path")
-    top_k = output_cfg.get("top_k", 1)
+    top_k = output_cfg.get("top_k", 5)
     saved_checkpoints: list[dict] = []
     global_step = 0
-
-    # MML optimizer setup (only active when optimize_length_scale=True in model config)
-    mml_cfg = cfg.get("mml", {})
-    mml_enabled = (
-        mml_cfg.get("enabled", False)
-        and model_cfg.get("optimize_length_scale", False)
-        and not smoke_test
-    )
-    mml_optimizer = None
-    mml_loader_iter = None
-    mml_interval = mml_cfg.get("interval_epochs", 1)
-    mml_steps_per_interval = mml_cfg.get("steps_per_interval", 5)
-    if mml_enabled:
-        mml_optimizer = torch.optim.Adam(
-            [model.classifier.log_length_scale],
-            lr=mml_cfg.get("lr", 1e-3),
-        )
-        mml_loader_iter = iter(itertools.cycle(val_loader))
 
     epoch_progress = tqdm(range(1, num_epochs + 1), desc="Epoch", leave=True)
     for epoch in epoch_progress:
@@ -284,47 +242,28 @@ def main(cfg: dict) -> None:
         )
         scheduler.step()
 
-        if mml_enabled and epoch % mml_interval == 0:
-            mml_loss = mml_step(
-                model=model,
-                gp_layer=model.classifier,
-                mml_loader_iter=mml_loader_iter,
-                mml_optimizer=mml_optimizer,
-                device=device,
-                mml_steps=mml_steps_per_interval,
-            )
-            current_ls = model.classifier.log_length_scale.exp().item()
-            # Rebuild precision matrix under the updated length scale
-            rebuild_precision_matrix(model, train_loader, device)
-            if run is not None:
-                run.log({"mml/loss": mml_loss, "mml/length_scale": current_ls, "train/epoch": epoch})
-
         should_evaluate = epoch % eval_interval == 0 or epoch == num_epochs
-        val_loss = None
-        val_acc = None
-        val_nll = None
+        val_metrics = None
         if should_evaluate:
-            metrics = evaluate_sngp(
+            val_metrics = evaluate_sngp(
                 model=model,
                 loader=val_loader,
                 device=device,
                 num_mc_samples=num_mc_samples,
             )
-            val_loss = metrics["loss"]
-            val_acc = metrics["accuracy"]
-            val_nll = metrics["nll"]
             print(
                 f"Epoch {epoch:3d}/{num_epochs} | "
                 f"Train Loss: {train_loss:.4f} | "
                 f"Train Acc: {train_acc * 100:.2f}% | "
-                f"Val Loss: {val_loss:.4f} | "
-                f"Val Acc: {val_acc * 100:.2f}% | "
-                f"Val NLL: {val_nll:.4f}"
+                f"Val Loss: {val_metrics['loss']:.4f} | "
+                f"Val Acc: {val_metrics['accuracy'] * 100:.2f}% | "
+                f"Val NLL: {val_metrics['nll']:.4f} | "
+                f"Val ECE: {val_metrics['ece']:.4f}"
             )
             epoch_progress.set_postfix(
                 train_loss=f"{train_loss:.4f}",
                 train_acc=f"{train_acc * 100:.2f}%",
-                val_acc=f"{val_acc * 100:.2f}%",
+                val_acc=f"{val_metrics['accuracy'] * 100:.2f}%",
             )
         else:
             print(
@@ -344,26 +283,26 @@ def main(cfg: dict) -> None:
                 "train/lr": optimizer.param_groups[0]["lr"],
                 "train/epoch": epoch,
             }
-            if val_loss is not None and val_acc is not None and val_nll is not None:
-                log_data["eval/loss"] = val_loss
-                log_data["eval/accuracy"] = val_acc
-                log_data["eval/nll"] = val_nll
+            if val_metrics is not None:
+                log_data["val/loss"] = val_metrics["loss"]
+                log_data["val/accuracy"] = val_metrics["accuracy"]
+                log_data["val/nll"] = val_metrics["nll"]
+                log_data["val/ece"] = val_metrics["ece"]
             run.log(log_data)
 
-        if val_acc is None:
+        if val_metrics is None:
             continue
 
+        val_acc = val_metrics["accuracy"]
         if val_acc > best_acc:
             best_acc = val_acc
+
         checkpoint_state = {
             "epoch": epoch,
             "model_state_dict": model.state_dict(),
             "optimizer_state_dict": optimizer.state_dict(),
-            "val_accuracy": val_acc,
-            "val_loss": val_loss,
-            "val_nll": val_nll,
+            "val_metrics": val_metrics,
             "config": cfg,
-            "log_length_scale": model.classifier.log_length_scale.item(),
         }
         if checkpoint_path:
             update_topk_checkpoints(
@@ -396,18 +335,29 @@ def main(cfg: dict) -> None:
         if saved_checkpoints:
             import wandb
 
-            artifact = wandb.Artifact("cifar100_sngp_best_model", type="model")
+            artifact = wandb.Artifact("cifar100_wideresnet_sngp_best_model", type="model")
             artifact.add_file(str(saved_checkpoints[0]["path"]), name=saved_checkpoints[0]["path"].name)
             run.log_artifact(artifact)
         run.finish()
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="CIFAR-100 SNGP experiment")
+    parser = argparse.ArgumentParser(description="CIFAR-100 WideResNet SNGP experiment")
     parser.add_argument("--config", required=True, help="Path to YAML config file")
+    parser.add_argument("--seed", type=int, default=None, help="Random seed (overrides config)")
+    parser.add_argument("--run-name", type=str, default=None, dest="run_name",
+                        help="W&B run name (overrides config)")
     args = parser.parse_args()
 
     with open(args.config) as f:
         cfg = yaml.safe_load(f)
+
+    if args.seed is not None:
+        cfg.setdefault("training", {})["seed"] = args.seed
+        if cfg.get("output", {}).get("checkpoint_path"):
+            p = Path(cfg["output"]["checkpoint_path"])
+            cfg["output"]["checkpoint_path"] = str(p.parent / f"seed{args.seed}" / p.name)
+    if args.run_name:
+        cfg.setdefault("wandb", {})["run_name"] = args.run_name
 
     main(cfg)

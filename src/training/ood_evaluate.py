@@ -196,7 +196,7 @@ def evaluate_cifarc_split(
         labels: (N,)   ground-truth class indices.
 
     Returns:
-        {"accuracy": float, "ece": float, "mce": float}
+        {"accuracy": float, "ece": float, "mce": float, "nll": float}
     """
     from src.training.evaluate import _classification_ece, _classification_mce
 
@@ -204,4 +204,5 @@ def evaluate_cifarc_split(
     accuracy = (preds == labels).float().mean().item()
     ece = _classification_ece(probs, labels)
     mce = _classification_mce(probs, labels)
-    return {"accuracy": accuracy, "ece": ece, "mce": mce}
+    nll = -probs.clamp_min(1e-12).log().gather(1, labels.unsqueeze(1)).mean().item()
+    return {"accuracy": accuracy, "ece": ece, "mce": mce, "nll": nll}

@@ -243,3 +243,187 @@ def get_cifar10_supcon_loaders(
         val_dataset,
         test_eval_dataset,
     )
+
+
+def get_cifar10_simclr_loaders(
+    data_root: str,
+    batch_size: int,
+    num_workers: int = 0,
+    smoke_test: bool = False,
+    val_split: float = 0.1,
+):
+    """
+    Returns CIFAR-10 loaders for self-supervised SimCLR pretraining.
+
+    The training loader yields ``(views, labels)`` where ``views`` has shape
+    ``(batch_size, 2, 3, 32, 32)``.  Labels are not used during pretraining
+    but are retained so the loader can be reused for kNN evaluation.
+
+    A memory loader (eval transforms, no augmentation) is also returned for
+    periodic kNN-accuracy monitoring.
+
+    Returns:
+        train_loader, memory_loader,
+        train_dataset, memory_dataset
+    """
+    if smoke_test:
+        n_train = 160
+        train_images = torch.randn(n_train, 3, 32, 32)
+        train_labels = torch.randint(0, 10, (n_train,))
+
+        train_contrastive = torch.utils.data.TensorDataset(
+            train_images.unsqueeze(1).repeat(1, 2, 1, 1, 1), train_labels
+        )
+        train_memory = torch.utils.data.TensorDataset(train_images, train_labels)
+
+        train_loader = DataLoader(train_contrastive, batch_size=batch_size, shuffle=True)
+        memory_loader = DataLoader(train_memory, batch_size=batch_size, shuffle=False)
+        return train_loader, memory_loader, train_contrastive, train_memory
+
+    simclr_transform = transforms.Compose([
+        transforms.RandomResizedCrop(32, scale=(0.2, 1.0)),
+        transforms.RandomHorizontalFlip(),
+        transforms.RandomApply(
+            [transforms.ColorJitter(0.4, 0.4, 0.4, 0.1)],
+            p=0.8,
+        ),
+        transforms.RandomGrayscale(p=0.2),
+        transforms.ToTensor(),
+        transforms.Normalize(_CIFAR10_MEAN, _CIFAR10_STD),
+    ])
+    eval_transform = transforms.Compose([
+        transforms.ToTensor(),
+        transforms.Normalize(_CIFAR10_MEAN, _CIFAR10_STD),
+    ])
+
+    train_contrastive_full = torchvision.datasets.CIFAR10(
+        root=data_root,
+        train=True,
+        download=True,
+        transform=TwoCropTransform(simclr_transform),
+    )
+    train_eval_full = torchvision.datasets.CIFAR10(
+        root=data_root,
+        train=True,
+        download=True,
+        transform=eval_transform,
+    )
+
+    n_total = len(train_contrastive_full)  # 50 000
+    n_val = int(n_total * val_split)       # 5 000
+    n_train = n_total - n_val              # 45 000
+
+    rng = torch.Generator().manual_seed(42)
+    perm = torch.randperm(n_total, generator=rng)
+    train_indices = perm[:n_train].tolist()
+
+    train_contrastive_dataset = Subset(train_contrastive_full, train_indices)
+    train_memory_dataset = Subset(train_eval_full, train_indices)
+
+    train_loader = DataLoader(
+        train_contrastive_dataset,
+        batch_size=batch_size,
+        shuffle=True,
+        num_workers=num_workers,
+        pin_memory=True,
+        drop_last=True,
+    )
+    memory_loader = DataLoader(
+        train_memory_dataset,
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=num_workers,
+        pin_memory=True,
+    )
+    return train_loader, memory_loader, train_contrastive_dataset, train_memory_dataset
+
+
+_DINOV2_MEAN = (0.485, 0.456, 0.406)
+_DINOV2_STD = (0.229, 0.224, 0.225)
+_DINOV2_SIZE = 224
+
+
+def get_cifar10_dinov2_loaders(
+    data_root: str,
+    batch_size: int,
+    num_workers: int = 0,
+    smoke_test: bool = False,
+    val_split: float = 0.1,
+):
+    """
+    Returns CIFAR-10 DataLoaders preprocessed for DINOv2.
+
+    Images are resized from 32×32 to 224×224 (BICUBIC) and normalized with
+    ImageNet statistics, matching the DINOv2 ViT pretraining distribution.
+    Train/val split uses the same seed=42 permutation as get_cifar10_loaders.
+
+    Returns:
+        train_loader, val_loader, test_loader,
+        dataset_train, dataset_val, dataset_test
+    """
+    if smoke_test:
+        n_train, n_val, n_test = 160, 40, 50
+        dataset_train = TensorDataset(
+            torch.randn(n_train, 3, _DINOV2_SIZE, _DINOV2_SIZE),
+            torch.randint(0, 10, (n_train,)),
+        )
+        dataset_val = TensorDataset(
+            torch.randn(n_val, 3, _DINOV2_SIZE, _DINOV2_SIZE),
+            torch.randint(0, 10, (n_val,)),
+        )
+        dataset_test = TensorDataset(
+            torch.randn(n_test, 3, _DINOV2_SIZE, _DINOV2_SIZE),
+            torch.randint(0, 10, (n_test,)),
+        )
+        train_loader = DataLoader(dataset_train, batch_size=batch_size, shuffle=True)
+        val_loader = DataLoader(dataset_val, batch_size=batch_size, shuffle=False)
+        test_loader = DataLoader(dataset_test, batch_size=batch_size, shuffle=False)
+        return train_loader, val_loader, test_loader, dataset_train, dataset_val, dataset_test
+
+    transform_train = transforms.Compose([
+        transforms.Resize(_DINOV2_SIZE, interpolation=transforms.InterpolationMode.BICUBIC),
+        transforms.RandomHorizontalFlip(),
+        transforms.ToTensor(),
+        transforms.Normalize(_DINOV2_MEAN, _DINOV2_STD),
+    ])
+    transform_eval = transforms.Compose([
+        transforms.Resize(_DINOV2_SIZE, interpolation=transforms.InterpolationMode.BICUBIC),
+        transforms.ToTensor(),
+        transforms.Normalize(_DINOV2_MEAN, _DINOV2_STD),
+    ])
+
+    dataset_train_aug = torchvision.datasets.CIFAR10(
+        root=data_root, train=True, download=True, transform=transform_train
+    )
+    dataset_train_eval = torchvision.datasets.CIFAR10(
+        root=data_root, train=True, download=True, transform=transform_eval
+    )
+    dataset_test = torchvision.datasets.CIFAR10(
+        root=data_root, train=False, download=True, transform=transform_eval
+    )
+
+    n_total = len(dataset_train_aug)
+    n_val_ = int(n_total * val_split)
+    n_train = n_total - n_val_
+
+    rng = torch.Generator().manual_seed(42)
+    perm = torch.randperm(n_total, generator=rng)
+    train_indices = perm[:n_train].tolist()
+    val_indices = perm[n_train:].tolist()
+
+    dataset_train = Subset(dataset_train_aug, train_indices)
+    dataset_val = Subset(dataset_train_eval, val_indices)
+
+    train_loader = DataLoader(
+        dataset_train, batch_size=batch_size, shuffle=True,
+        num_workers=num_workers, pin_memory=True,
+    )
+    val_loader = DataLoader(
+        dataset_val, batch_size=batch_size, shuffle=False,
+        num_workers=num_workers, pin_memory=True,
+    )
+    test_loader = DataLoader(
+        dataset_test, batch_size=batch_size, shuffle=False,
+        num_workers=num_workers, pin_memory=True,
+    )
+    return train_loader, val_loader, test_loader, dataset_train, dataset_val, dataset_test
