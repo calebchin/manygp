@@ -22,11 +22,12 @@ def get_bike_loaders(
     data_path: str,
     batch_size: int,
     train_frac: float = 0.75,
+    val_frac: float = 0.15,
     smoke_test: bool = False,
     device: str = "cpu",
 ):
     """
-    Load, preprocess, and split the UCI Bike Sharing dataset.
+    Load, preprocess, and split the UCI Bike Sharing dataset into train/val/test.
 
     Fixes from the original notebook:
     - Creates train_loader and test_loader (DataLoader objects) that were missing.
@@ -36,12 +37,14 @@ def get_bike_loaders(
         data_path:  Path to hour.csv (downloaded here if missing).
         batch_size: Mini-batch size.
         train_frac: Fraction of data used for training (default 0.75).
+        val_frac:   Fraction of data used for validation (default 0.15).
+                    The remaining (1 - train_frac - val_frac) is used for test.
         smoke_test: If True, uses synthetic data (1000 samples, 3 features).
         device:     Device string to move tensors to.
 
     Returns:
-        train_loader, test_loader,
-        train_x, train_y, test_x, test_y,
+        train_loader, val_loader, test_loader,
+        train_x, train_y, val_x, val_y, test_x, test_y,
         train_n  (int, needed for DeepPredictiveLogLikelihood num_data)
     """
     if smoke_test:
@@ -59,26 +62,54 @@ def get_bike_loaders(
         data = torch.tensor(df[_FEATURE_COLS + ["cnt"]].values, dtype=torch.float32)
 
         X = data[:, :-1]
-        X = X - X.min(0)[0]
-        X = 2.0 * (X / X.max(0)[0]) - 1.0
-
         y = data[:, -1]
-        y = (y - y.mean()) / y.std()
 
     shuffled = torch.randperm(X.size(0))
     X, y = X[shuffled], y[shuffled]
 
-    train_n = int(floor(train_frac * X.size(0)))
-    train_x = X[:train_n].contiguous().to(device)
-    train_y = y[:train_n].contiguous().to(device)
-    test_x = X[train_n:].contiguous().to(device)
-    test_y = y[train_n:].contiguous().to(device)
+    n = X.size(0)
+    train_n = int(floor(train_frac * n))
+    val_n = int(floor(val_frac * n))
+
+    train_x_raw = X[:train_n]
+    val_x_raw   = X[train_n:train_n + val_n]
+    test_x_raw  = X[train_n + val_n:]
+    train_y_raw = y[:train_n]
+    val_y_raw   = y[train_n:train_n + val_n]
+    test_y_raw  = y[train_n + val_n:]
+
+    if not smoke_test:
+        # z-score using train statistics only (no leakage into val/test)
+        x_mean, x_std = train_x_raw.mean(0), train_x_raw.std(0)
+        x_std[x_std == 0] = 1.0  # guard for constant columns
+        y_mean, y_std = train_y_raw.mean(), train_y_raw.std()
+
+        train_x_raw = (train_x_raw - x_mean) / x_std
+        val_x_raw   = (val_x_raw   - x_mean) / x_std
+        test_x_raw  = (test_x_raw  - x_mean) / x_std
+        train_y_raw = (train_y_raw - y_mean) / y_std
+        val_y_raw   = (val_y_raw   - y_mean) / y_std
+        test_y_raw  = (test_y_raw  - y_mean) / y_std
+
+    train_x = train_x_raw.contiguous().to(device)
+    train_y = train_y_raw.contiguous().to(device)
+    val_x   = val_x_raw.contiguous().to(device)
+    val_y   = val_y_raw.contiguous().to(device)
+    test_x  = test_x_raw.contiguous().to(device)
+    test_y  = test_y_raw.contiguous().to(device)
 
     train_loader = DataLoader(
         TensorDataset(train_x, train_y), batch_size=batch_size, shuffle=True
+    )
+    val_loader = DataLoader(
+        TensorDataset(val_x, val_y), batch_size=batch_size, shuffle=False
     )
     test_loader = DataLoader(
         TensorDataset(test_x, test_y), batch_size=batch_size, shuffle=False
     )
 
-    return train_loader, test_loader, train_x, train_y, test_x, test_y, train_n
+    return (
+        train_loader, val_loader, test_loader,
+        train_x, train_y, val_x, val_y, test_x, test_y,
+        train_n,
+    )

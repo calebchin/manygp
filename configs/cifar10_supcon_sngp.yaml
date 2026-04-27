@@ -5,10 +5,10 @@ experiment:
 data:
   root: ../datafolder/data
   batch_size: 256
-  num_workers: 4
+  num_workers: 2
 
 model:
-  width: 64
+  widen_factor: 10
   embedding_dim: 128
   num_classes: 10
   hidden_dims: []
@@ -40,6 +40,6 @@ output:
 
 wandb:
   enabled: true
-  project: sngp
+  project: Updated_run
   entity: sta414manygp
   run_name: cifar10_supcon_sngp

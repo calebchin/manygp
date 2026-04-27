@@ -1,0 +1,37 @@
+experiment:
+  name: cifar100_sngp
+  smoke_test: false
+
+data:
+  root: ../datafolder/data
+  batch_size: 256
+  num_workers: 4
+
+model:
+  num_classes: 100
+  width: 64
+  hidden_dim: 128
+  spec_norm_bound: 0.95
+  num_inducing: 1024
+  ridge_penalty: 1.0
+  feature_scale: 2.0
+  gp_cov_momentum: -1.0
+  normalize_input: false
+
+training:
+  epochs: 100
+  eval_interval: 5
+  log_every_steps: 20
+  lr: 0.001
+  weight_decay: 0.0
+  num_mc_samples: 10
+
+output:
+  checkpoint_path: ./checkpoints_sngp/cifar100_sngp.pt
+  top_k: 10
+
+wandb:
+  enabled: true
+  project: sngp
+  entity: sta414manygp
+  run_name: cifar100_vanilla_sngp

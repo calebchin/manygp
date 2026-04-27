@@ -1,0 +1,413 @@
+"""
+CIFAR-100 SNGP training with a spectrally normalized ResNet backbone.
+
+Usage:
+    python experiments/cifar100_sngp.py --config configs/cifar100_sngp.yaml
+"""
+
+import argparse
+import itertools
+import math
+import os
+import sys
+from pathlib import Path
+
+import torch
+import yaml
+from tqdm.auto import tqdm
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+from src.data.cifar100 import get_cifar100_loaders
+from src.models.sngp import SNGPResNetClassifier, laplace_predictive_probs
+from src.utils.model_summary import print_model_summary
+
+
+def update_topk_checkpoints(
+    saved_checkpoints: list[dict],
+    top_k: int,
+    checkpoint_path: str,
+    state: dict,
+    metric_name: str,
+    metric_value: float,
+    epoch: int,
+) -> None:
+    if top_k <= 0:
+        return
+
+    checkpoint_target = Path(checkpoint_path)
+    checkpoint_target.parent.mkdir(parents=True, exist_ok=True)
+    checkpoint_stem = checkpoint_target.stem
+    checkpoint_suffix = checkpoint_target.suffix or ".pt"
+    candidate_path = checkpoint_target.parent / (
+        f"{checkpoint_stem}_epoch{epoch:03d}_{metric_name}{metric_value:.4f}{checkpoint_suffix}"
+    )
+
+    if len(saved_checkpoints) < top_k:
+        torch.save(state, candidate_path)
+        saved_checkpoints.append({"metric": metric_value, "path": candidate_path, "epoch": epoch})
+    else:
+        worst_checkpoint = min(saved_checkpoints, key=lambda item: (item["metric"], -item["epoch"]))
+        if metric_value <= worst_checkpoint["metric"]:
+            return
+
+        torch.save(state, candidate_path)
+        saved_checkpoints.append({"metric": metric_value, "path": candidate_path, "epoch": epoch})
+        worst_checkpoint["path"].unlink(missing_ok=True)
+        saved_checkpoints.remove(worst_checkpoint)
+
+    saved_checkpoints.sort(key=lambda item: item["metric"], reverse=True)
+
+
+def train_epoch(
+    model: torch.nn.Module,
+    loader,
+    optimizer: torch.optim.Optimizer,
+    loss_fn: torch.nn.Module,
+    device: torch.device,
+    epoch: int,
+    show_progress: bool = True,
+    run=None,
+    log_every_steps: int | None = None,
+    global_step: int = 0,
+) -> tuple[float, float, int]:
+    model.train()
+    model.reset_precision_matrix()
+    running_loss = 0.0
+    total_correct = 0
+    total_examples = 0
+
+    progress = tqdm(loader, desc=f"SNGP Epoch {epoch}", leave=False, disable=not show_progress)
+    for images, labels in progress:
+        images = images.to(device, non_blocking=True)
+        labels = labels.to(device, non_blocking=True)
+
+        optimizer.zero_grad(set_to_none=True)
+        logits = model(images, update_precision=True)
+        loss = loss_fn(logits, labels)
+        loss.backward()
+        optimizer.step()
+
+        global_step += 1
+        running_loss += loss.item()
+        total_correct += (logits.argmax(dim=1) == labels).sum().item()
+        total_examples += labels.size(0)
+        progress.set_postfix(loss=f"{loss.item():.4f}")
+
+        if run is not None and log_every_steps is not None and log_every_steps > 0:
+            if global_step % log_every_steps == 0:
+                run.log({
+                    "train/step_loss": loss.item(),
+                    "train/global_step": global_step,
+                    "train/epoch": epoch,
+                    "train/lr_step": optimizer.param_groups[0]["lr"],
+                })
+
+    return running_loss / len(loader), total_correct / total_examples, global_step
+
+
+@torch.no_grad()
+def evaluate_sngp(
+    model: torch.nn.Module,
+    loader,
+    device: torch.device,
+    num_mc_samples: int = 10,
+) -> dict[str, float]:
+    model.eval()
+    running_loss = 0.0
+    total_correct = 0
+    total_examples = 0
+    total_nll = 0.0
+
+    for images, labels in loader:
+        images = images.to(device, non_blocking=True)
+        labels = labels.to(device, non_blocking=True)
+        logits, variances = model(images, return_cov=True)
+        probs = laplace_predictive_probs(logits, variances, num_mc_samples=num_mc_samples)
+        log_probs = probs.clamp_min(1e-12).log()
+        loss = -log_probs.gather(1, labels.unsqueeze(1)).mean()
+
+        running_loss += loss.item()
+        total_correct += (probs.argmax(dim=1) == labels).sum().item()
+        total_examples += labels.size(0)
+        total_nll += -log_probs.gather(1, labels.unsqueeze(1)).sum().item()
+
+    return {
+        "loss": running_loss / len(loader),
+        "accuracy": total_correct / total_examples,
+        "nll": total_nll / total_examples,
+    }
+
+
+def mml_step(
+    model: torch.nn.Module,
+    gp_layer: torch.nn.Module,
+    mml_loader_iter,
+    mml_optimizer: torch.optim.Optimizer,
+    device: torch.device,
+    mml_steps: int = 1,
+) -> float:
+    """
+    Run mml_steps gradient updates on log_length_scale using the Laplace MML objective.
+
+    All model parameters except log_length_scale are frozen during this step.
+    Returns the mean MML loss over the steps.
+    """
+    for p in model.parameters():
+        p.requires_grad_(False)
+    gp_layer.log_length_scale.requires_grad_(True)
+
+    total_loss = 0.0
+    for _ in range(mml_steps):
+        images, labels = next(mml_loader_iter)
+        images, labels = images.to(device), labels.to(device)
+        mml_optimizer.zero_grad()
+        # Detach backbone features: gradient w.r.t. log_l comes through
+        # random_weight / exp(log_l), not through the features themselves.
+        with torch.no_grad():
+            features = model.encode(images)
+        loss = gp_layer.compute_laplace_log_mml(features, labels)
+        loss.backward()
+        mml_optimizer.step()
+        total_loss += loss.item()
+
+    for p in model.parameters():
+        p.requires_grad_(True)
+    return total_loss / mml_steps
+
+
+def rebuild_precision_matrix(
+    model: torch.nn.Module,
+    train_loader,
+    device: torch.device,
+) -> None:
+    """Reset and rebuild the precision matrix after a length scale update."""
+    model.reset_precision_matrix()
+    model.train()
+    with torch.no_grad():
+        for images, _ in train_loader:
+            model(images.to(device), update_precision=True)
+
+
+def main(cfg: dict) -> None:
+    smoke_test = cfg["experiment"]["smoke_test"]
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"Device: {device}")
+
+    run = None
+    wandb_cfg = cfg.get("wandb", {})
+    if wandb_cfg.get("enabled", False):
+        import wandb
+
+        run = wandb.init(
+            project=wandb_cfg.get("project", "sngp"),
+            entity=wandb_cfg.get("entity") or "sta414manygp",
+            name=wandb_cfg.get("run_name") or None,
+            config=cfg,
+        )
+
+    data_cfg = cfg["data"]
+    train_loader, val_loader, train_dataset, val_dataset = get_cifar100_loaders(
+        data_root=data_cfg["root"],
+        batch_size=data_cfg["batch_size"],
+        num_workers=data_cfg["num_workers"],
+        smoke_test=smoke_test,
+    )
+    print(f"Train size: {len(train_dataset)}, val size: {len(val_dataset)}")
+
+    model_cfg = cfg["model"]
+    model = SNGPResNetClassifier(
+        num_classes=model_cfg["num_classes"],
+        width=model_cfg["width"],
+        hidden_dim=model_cfg["hidden_dim"],
+        spec_norm_bound=model_cfg["spec_norm_bound"],
+        num_inducing=model_cfg["num_inducing"],
+        ridge_penalty=model_cfg["ridge_penalty"],
+        feature_scale=model_cfg["feature_scale"],
+        gp_cov_momentum=model_cfg["gp_cov_momentum"],
+        normalize_input=model_cfg["normalize_input"],
+    ).to(device)
+    print_model_summary(model)
+    train_cfg = cfg["training"]
+    optimizer = torch.optim.Adam(
+        model.parameters(),
+        lr=train_cfg["lr"],
+        weight_decay=train_cfg["weight_decay"],
+    )
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+        optimizer,
+        T_max=1 if smoke_test else train_cfg["epochs"],
+    )
+    loss_fn = torch.nn.CrossEntropyLoss()
+    best_acc = -1.0
+    num_epochs = 1 if smoke_test else train_cfg["epochs"]
+    eval_interval = 1 if smoke_test else train_cfg.get("eval_interval", 1)
+    log_every_steps = train_cfg.get("log_every_steps", None)
+    num_mc_samples = train_cfg.get("num_mc_samples", 10)
+    output_cfg = cfg.get("output", {})
+    checkpoint_path = output_cfg.get("checkpoint_path")
+    top_k = output_cfg.get("top_k", 1)
+    saved_checkpoints: list[dict] = []
+    global_step = 0
+
+    # MML optimizer setup (only active when optimize_length_scale=True in model config)
+    mml_cfg = cfg.get("mml", {})
+    mml_enabled = (
+        mml_cfg.get("enabled", False)
+        and model_cfg.get("optimize_length_scale", False)
+        and not smoke_test
+    )
+    mml_optimizer = None
+    mml_loader_iter = None
+    mml_interval = mml_cfg.get("interval_epochs", 1)
+    mml_steps_per_interval = mml_cfg.get("steps_per_interval", 5)
+    if mml_enabled:
+        mml_optimizer = torch.optim.Adam(
+            [model.classifier.log_length_scale],
+            lr=mml_cfg.get("lr", 1e-3),
+        )
+        mml_loader_iter = iter(itertools.cycle(val_loader))
+
+    epoch_progress = tqdm(range(1, num_epochs + 1), desc="Epoch", leave=True)
+    for epoch in epoch_progress:
+        train_loss, train_acc, global_step = train_epoch(
+            model=model,
+            loader=train_loader,
+            optimizer=optimizer,
+            loss_fn=loss_fn,
+            device=device,
+            epoch=epoch,
+            show_progress=True,
+            run=run,
+            log_every_steps=log_every_steps,
+            global_step=global_step,
+        )
+        scheduler.step()
+
+        if mml_enabled and epoch % mml_interval == 0:
+            mml_loss = mml_step(
+                model=model,
+                gp_layer=model.classifier,
+                mml_loader_iter=mml_loader_iter,
+                mml_optimizer=mml_optimizer,
+                device=device,
+                mml_steps=mml_steps_per_interval,
+            )
+            current_ls = model.classifier.log_length_scale.exp().item()
+            # Rebuild precision matrix under the updated length scale
+            rebuild_precision_matrix(model, train_loader, device)
+            if run is not None:
+                run.log({"mml/loss": mml_loss, "mml/length_scale": current_ls, "train/epoch": epoch})
+
+        should_evaluate = epoch % eval_interval == 0 or epoch == num_epochs
+        val_loss = None
+        val_acc = None
+        val_nll = None
+        if should_evaluate:
+            metrics = evaluate_sngp(
+                model=model,
+                loader=val_loader,
+                device=device,
+                num_mc_samples=num_mc_samples,
+            )
+            val_loss = metrics["loss"]
+            val_acc = metrics["accuracy"]
+            val_nll = metrics["nll"]
+            print(
+                f"Epoch {epoch:3d}/{num_epochs} | "
+                f"Train Loss: {train_loss:.4f} | "
+                f"Train Acc: {train_acc * 100:.2f}% | "
+                f"Val Loss: {val_loss:.4f} | "
+                f"Val Acc: {val_acc * 100:.2f}% | "
+                f"Val NLL: {val_nll:.4f}"
+            )
+            epoch_progress.set_postfix(
+                train_loss=f"{train_loss:.4f}",
+                train_acc=f"{train_acc * 100:.2f}%",
+                val_acc=f"{val_acc * 100:.2f}%",
+            )
+        else:
+            print(
+                f"Epoch {epoch:3d}/{num_epochs} | "
+                f"Train Loss: {train_loss:.4f} | "
+                f"Train Acc: {train_acc * 100:.2f}%"
+            )
+            epoch_progress.set_postfix(
+                train_loss=f"{train_loss:.4f}",
+                train_acc=f"{train_acc * 100:.2f}%",
+            )
+
+        if run is not None:
+            log_data = {
+                "train/loss": train_loss,
+                "train/accuracy": train_acc,
+                "train/lr": optimizer.param_groups[0]["lr"],
+                "train/epoch": epoch,
+            }
+            if val_loss is not None and val_acc is not None and val_nll is not None:
+                log_data["eval/loss"] = val_loss
+                log_data["eval/accuracy"] = val_acc
+                log_data["eval/nll"] = val_nll
+            run.log(log_data)
+
+        if val_acc is None:
+            continue
+
+        if val_acc > best_acc:
+            best_acc = val_acc
+        checkpoint_state = {
+            "epoch": epoch,
+            "model_state_dict": model.state_dict(),
+            "optimizer_state_dict": optimizer.state_dict(),
+            "val_accuracy": val_acc,
+            "val_loss": val_loss,
+            "val_nll": val_nll,
+            "config": cfg,
+            "log_length_scale": model.classifier.log_length_scale.item(),
+        }
+        if checkpoint_path:
+            update_topk_checkpoints(
+                saved_checkpoints=saved_checkpoints,
+                top_k=top_k,
+                checkpoint_path=checkpoint_path,
+                state=checkpoint_state,
+                metric_name="acc",
+                metric_value=val_acc,
+                epoch=epoch,
+            )
+
+    if saved_checkpoints:
+        print("Saved top checkpoints:")
+        for checkpoint in saved_checkpoints:
+            print(
+                f"  epoch {checkpoint['epoch']:3d} | "
+                f"val acc {checkpoint['metric'] * 100:.2f}% | "
+                f"{checkpoint['path']}"
+            )
+
+    if best_acc >= 0.0:
+        print(f"Best validation accuracy: {best_acc * 100:.2f}%")
+    else:
+        print("Best validation accuracy: not evaluated")
+
+    if run is not None:
+        if best_acc >= 0.0:
+            run.log({"best/val_accuracy": best_acc})
+        if saved_checkpoints:
+            import wandb
+
+            artifact = wandb.Artifact("cifar100_sngp_best_model", type="model")
+            artifact.add_file(str(saved_checkpoints[0]["path"]), name=saved_checkpoints[0]["path"].name)
+            run.log_artifact(artifact)
+        run.finish()
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="CIFAR-100 SNGP experiment")
+    parser.add_argument("--config", required=True, help="Path to YAML config file")
+    args = parser.parse_args()
+
+    with open(args.config) as f:
+        cfg = yaml.safe_load(f)
+
+    main(cfg)

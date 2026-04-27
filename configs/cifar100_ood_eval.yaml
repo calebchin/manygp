@@ -1,0 +1,31 @@
+experiment:
+  name: cifar100_ood_eval
+
+model:
+  # Path to a trained CIFAR-100 checkpoint (any model type).
+  # The model type is inferred from checkpoint['config']['experiment']['name'].
+  checkpoint_path: ./checkpoints_sngp/cifar100_sngp_epoch100_acc0.7800.pt
+  num_mc_samples: 10
+
+data:
+  root: ../datafolder/data
+  batch_size: 256
+  num_workers: 4
+
+ood:
+  # Root directory where CIFAR-100-C/ will be placed (auto-downloaded if absent).
+  cifarc_root: ../datafolder/data
+  # Set to a list to evaluate a subset, e.g. [gaussian_noise, fog].
+  # null = evaluate all 15 corruption types.
+  corruptions: null
+  severities: [1, 2, 3, 4, 5]
+
+output:
+  results_path: ./results/cifar100_ood_eval.json
+  csv_path: ./results/cifar100_ood_cifarc.csv
+
+wandb:
+  enabled: false
+  project: sngp
+  entity: sta414manygp
+  run_name: cifar100_ood_eval

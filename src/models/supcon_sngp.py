@@ -9,7 +9,7 @@ from .sngp import RandomFeatureGaussianProcess
 
 class CifarResNetSupConSNGPClassifier(nn.Module):
     """
-    End-to-end CIFAR ResNet encoder with a plain MLP head and SNGP output layer.
+    Wide ResNet-28-10 encoder with an optional MLP head and SNGP output layer.
 
     The GP input features are exposed so supervised contrastive loss can be
     applied directly on the deterministic representation before the GP layer.
@@ -19,7 +19,7 @@ class CifarResNetSupConSNGPClassifier(nn.Module):
         self,
         embedding_dim: int,
         num_classes: int,
-        width: int = 64,
+        widen_factor: int = 10,
         hidden_dims: list[int] | tuple[int, ...] = (),
         dropout_rate: float = 0.0,
         num_inducing: int = 1024,
@@ -31,9 +31,10 @@ class CifarResNetSupConSNGPClassifier(nn.Module):
         input_normalization: str = "l2",
         kernel_scale: float = 1.0,
         length_scale: float = 1.0,
+        optimize_length_scale: bool = False,
     ):
         super().__init__()
-        self.encoder = CifarResNetEncoder(width=width, embedding_dim=embedding_dim)
+        self.encoder = CifarResNetEncoder(widen_factor=widen_factor, embedding_dim=embedding_dim)
         self.encoder_dim = self.encoder.output_dim
 
         layers = []
@@ -57,6 +58,7 @@ class CifarResNetSupConSNGPClassifier(nn.Module):
             input_normalization=input_normalization,
             kernel_scale=kernel_scale,
             length_scale=length_scale,
+            optimize_length_scale=optimize_length_scale,
         )
 
     def reset_precision_matrix(self) -> None:

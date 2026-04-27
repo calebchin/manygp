@@ -1,0 +1,44 @@
+experiment:
+  name: cifar10_sngp
+  smoke_test: false
+
+data:
+  root: ../datafolder/data
+  batch_size: 256
+  num_workers: 2
+
+model:
+  num_classes: 10
+  widen_factor: 10       # Wide ResNet-28-10 (as in Liu et al. 2020)
+  hidden_dim: 128        # GP input projection dimension
+  spec_norm_bound: 6.0   # Spectral norm bound c (paper Table 5: 6.0 for WRN on CIFAR)
+  num_inducing: 1024
+  ridge_penalty: 0.001   # Covariance ridge factor s (paper Table 5: 0.001)
+  feature_scale: 2.0     # Length-scale parameter l (paper Table 5: 2.0)
+  gp_cov_momentum: 0.999 # Covariance discount factor m (paper Table 5: 0.999, EMA — no per-epoch reset)
+  normalize_input: true  # Input layer normalization (paper Table 5: True)
+
+training:
+  epochs: 200
+  eval_interval: 5
+  log_every_steps: 20
+  lr: 0.001
+  weight_decay: 0.0
+  num_mc_samples: 10
+
+ood:
+  enabled: true
+  cifarc_root: ../datafolder/data
+  corruptions: null   # null = all 15 standard corruptions
+  severities: [1, 2, 3, 4, 5]
+
+output:
+  checkpoint_path: ./checkpoints_april2/sngp/cifar10_sngp.pt
+  top_k: 5
+  checkpoint_metric: val_accuracy   # options: val_ece (lower=better), val_loss (lower=better), val_accuracy (default, higher=better)
+
+wandb:
+  enabled: true
+  project: april_4_experiments
+  entity: sta414manygp
+  run_name: sngp

@@ -1,0 +1,50 @@
+experiment:
+  name: cifar10_dinov2_sngp
+  smoke_test: false
+
+data:
+  root: ../datafolder/data
+  batch_size: 128
+  num_workers: 4
+
+backbone:
+  model_name: dinov2_vits14
+  pretrained: true
+
+model:
+  num_classes: 10
+  hidden_dims: [256]
+  spec_norm_bound: 0.95
+  dropout_rate: 0.1
+  kernel_type: normalized_rbf
+  input_normalization: l2
+  kernel_scale: 1.0
+  length_scale: 1.0
+  num_inducing: 1024
+  ridge_penalty: 1.0
+  feature_scale: 2.0
+  gp_cov_momentum: -1.0
+  normalize_input: false
+
+training:
+  epochs: 50
+  eval_interval: 5
+  log_every_steps: 20
+  lr: 0.001
+  weight_decay: 0.0
+  num_mc_samples: 10
+  seed: 42
+
+ood:
+  enabled: true
+
+output:
+  checkpoint_path: ./checkpoints_april20/cifar10_dinov2_sngp/cifar10_dinov2_sngp.pt
+  top_k: 5
+  checkpoint_metric: val_accuracy
+
+wandb:
+  enabled: true
+  project: april_20_cifar10_dinov2_sngp
+  entity: sta414manygp
+  run_name: cifar10_dinov2_sngp_vits14

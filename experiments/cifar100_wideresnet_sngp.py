@@ -1,0 +1,363 @@
+"""
+CIFAR-100 SNGP training with a Wide ResNet-28-10 spectrally normalized backbone.
+
+Supports multi-seed experiments via --seed and --run-name arguments.
+
+Usage:
+    python experiments/cifar100_wideresnet_sngp.py \
+        --config configs/experiment_april6_cifar100_sngp.yaml \
+        --seed 0 \
+        --run-name cifar100_sngp_seed0
+"""
+
+import argparse
+import math
+import os
+import random
+import sys
+from pathlib import Path
+
+import numpy as np
+import torch
+import yaml
+from tqdm.auto import tqdm
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+from src.data.cifar100 import get_cifar100_loaders
+from src.models.sngp import SNGPResNetClassifier, laplace_predictive_probs
+from src.training.evaluate import _classification_ece
+from src.utils.model_summary import print_model_summary
+
+
+def update_topk_checkpoints(
+    saved_checkpoints: list[dict],
+    top_k: int,
+    checkpoint_path: str,
+    state: dict,
+    metric_name: str,
+    metric_value: float,
+    epoch: int,
+) -> None:
+    if top_k <= 0:
+        return
+
+    checkpoint_target = Path(checkpoint_path)
+    checkpoint_target.parent.mkdir(parents=True, exist_ok=True)
+    checkpoint_stem = checkpoint_target.stem
+    checkpoint_suffix = checkpoint_target.suffix or ".pt"
+    candidate_path = checkpoint_target.parent / (
+        f"{checkpoint_stem}_epoch{epoch:03d}_{metric_name}{metric_value:.4f}{checkpoint_suffix}"
+    )
+
+    if len(saved_checkpoints) < top_k:
+        torch.save(state, candidate_path)
+        saved_checkpoints.append({"metric": metric_value, "path": candidate_path, "epoch": epoch})
+    else:
+        worst_checkpoint = min(saved_checkpoints, key=lambda item: (item["metric"], -item["epoch"]))
+        if metric_value <= worst_checkpoint["metric"]:
+            return
+
+        torch.save(state, candidate_path)
+        saved_checkpoints.append({"metric": metric_value, "path": candidate_path, "epoch": epoch})
+        worst_checkpoint["path"].unlink(missing_ok=True)
+        saved_checkpoints.remove(worst_checkpoint)
+
+    saved_checkpoints.sort(key=lambda item: item["metric"], reverse=True)
+
+
+def train_epoch(
+    model: torch.nn.Module,
+    loader,
+    optimizer: torch.optim.Optimizer,
+    loss_fn: torch.nn.Module,
+    device: torch.device,
+    epoch: int,
+    show_progress: bool = True,
+    run=None,
+    log_every_steps: int | None = None,
+    global_step: int = 0,
+) -> tuple[float, float, int]:
+    model.train()
+    model.reset_precision_matrix()
+    running_loss = 0.0
+    total_correct = 0
+    total_examples = 0
+
+    progress = tqdm(loader, desc=f"SNGP Epoch {epoch}", leave=False, disable=not show_progress)
+    for images, labels in progress:
+        images = images.to(device, non_blocking=True)
+        labels = labels.to(device, non_blocking=True)
+
+        optimizer.zero_grad(set_to_none=True)
+        logits = model(images, update_precision=True)
+        loss = loss_fn(logits, labels)
+        loss.backward()
+        optimizer.step()
+
+        global_step += 1
+        running_loss += loss.item()
+        total_correct += (logits.argmax(dim=1) == labels).sum().item()
+        total_examples += labels.size(0)
+        progress.set_postfix(loss=f"{loss.item():.4f}")
+
+        if run is not None and log_every_steps is not None and log_every_steps > 0:
+            if global_step % log_every_steps == 0:
+                run.log({
+                    "train/step_loss": loss.item(),
+                    "train/global_step": global_step,
+                    "train/epoch": epoch,
+                    "train/lr_step": optimizer.param_groups[0]["lr"],
+                })
+
+    return running_loss / len(loader), total_correct / total_examples, global_step
+
+
+@torch.no_grad()
+def evaluate_sngp(
+    model: torch.nn.Module,
+    loader,
+    device: torch.device,
+    num_mc_samples: int = 10,
+) -> dict[str, float]:
+    model.eval()
+    running_loss = 0.0
+    total_correct = 0
+    total_examples = 0
+    total_nll = 0.0
+    all_probs = []
+    all_labels = []
+
+    for images, labels in loader:
+        images = images.to(device, non_blocking=True)
+        labels = labels.to(device, non_blocking=True)
+        logits, variances = model(images, return_cov=True)
+        probs = laplace_predictive_probs(logits, variances, num_mc_samples=num_mc_samples)
+        log_probs = probs.clamp_min(1e-12).log()
+        loss = -log_probs.gather(1, labels.unsqueeze(1)).mean()
+
+        running_loss += loss.item()
+        total_correct += (probs.argmax(dim=1) == labels).sum().item()
+        total_examples += labels.size(0)
+        total_nll += -log_probs.gather(1, labels.unsqueeze(1)).sum().item()
+        all_probs.append(probs.cpu())
+        all_labels.append(labels.cpu())
+
+    all_probs = torch.cat(all_probs, dim=0)
+    all_labels = torch.cat(all_labels, dim=0)
+    ece = _classification_ece(all_probs, all_labels)
+
+    return {
+        "loss": running_loss / len(loader),
+        "accuracy": total_correct / total_examples,
+        "nll": total_nll / total_examples,
+        "ece": ece,
+    }
+
+
+def main(cfg: dict) -> None:
+    smoke_test = cfg["experiment"]["smoke_test"]
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"Device: {device}")
+
+    seed = cfg.get("training", {}).get("seed", None)
+    if seed is not None:
+        random.seed(seed)
+        np.random.seed(seed)
+        torch.manual_seed(seed)
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed_all(seed)
+        print(f"Random seed: {seed}")
+
+    run = None
+    wandb_cfg = cfg.get("wandb", {})
+    if wandb_cfg.get("enabled", False):
+        import wandb
+
+        run = wandb.init(
+            project=wandb_cfg.get("project", "sngp"),
+            entity=wandb_cfg.get("entity") or "sta414manygp",
+            name=wandb_cfg.get("run_name") or None,
+            config=cfg,
+        )
+
+    data_cfg = cfg["data"]
+    train_loader, val_loader, train_dataset, val_dataset = get_cifar100_loaders(
+        data_root=data_cfg["root"],
+        batch_size=data_cfg["batch_size"],
+        num_workers=data_cfg["num_workers"],
+        smoke_test=smoke_test,
+    )
+    print(f"Train size: {len(train_dataset)}, val size: {len(val_dataset)}")
+
+    model_cfg = cfg["model"]
+    model = SNGPResNetClassifier(
+        num_classes=model_cfg["num_classes"],
+        widen_factor=model_cfg.get("widen_factor", 10),
+        hidden_dim=model_cfg["hidden_dim"],
+        spec_norm_bound=model_cfg["spec_norm_bound"],
+        num_inducing=model_cfg["num_inducing"],
+        ridge_penalty=model_cfg["ridge_penalty"],
+        feature_scale=model_cfg["feature_scale"],
+        gp_cov_momentum=model_cfg["gp_cov_momentum"],
+        normalize_input=model_cfg["normalize_input"],
+    ).to(device)
+    print_model_summary(model)
+
+    train_cfg = cfg["training"]
+    optimizer = torch.optim.Adam(
+        model.parameters(),
+        lr=train_cfg["lr"],
+        weight_decay=train_cfg["weight_decay"],
+    )
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+        optimizer,
+        T_max=1 if smoke_test else train_cfg["epochs"],
+    )
+    loss_fn = torch.nn.CrossEntropyLoss()
+    best_acc = -1.0
+    num_epochs = 1 if smoke_test else train_cfg["epochs"]
+    eval_interval = 1 if smoke_test else train_cfg.get("eval_interval", 5)
+    log_every_steps = train_cfg.get("log_every_steps", None)
+    num_mc_samples = train_cfg.get("num_mc_samples", 10)
+    output_cfg = cfg.get("output", {})
+    checkpoint_path = output_cfg.get("checkpoint_path")
+    top_k = output_cfg.get("top_k", 5)
+    saved_checkpoints: list[dict] = []
+    global_step = 0
+
+    epoch_progress = tqdm(range(1, num_epochs + 1), desc="Epoch", leave=True)
+    for epoch in epoch_progress:
+        train_loss, train_acc, global_step = train_epoch(
+            model=model,
+            loader=train_loader,
+            optimizer=optimizer,
+            loss_fn=loss_fn,
+            device=device,
+            epoch=epoch,
+            show_progress=True,
+            run=run,
+            log_every_steps=log_every_steps,
+            global_step=global_step,
+        )
+        scheduler.step()
+
+        should_evaluate = epoch % eval_interval == 0 or epoch == num_epochs
+        val_metrics = None
+        if should_evaluate:
+            val_metrics = evaluate_sngp(
+                model=model,
+                loader=val_loader,
+                device=device,
+                num_mc_samples=num_mc_samples,
+            )
+            print(
+                f"Epoch {epoch:3d}/{num_epochs} | "
+                f"Train Loss: {train_loss:.4f} | "
+                f"Train Acc: {train_acc * 100:.2f}% | "
+                f"Val Loss: {val_metrics['loss']:.4f} | "
+                f"Val Acc: {val_metrics['accuracy'] * 100:.2f}% | "
+                f"Val NLL: {val_metrics['nll']:.4f} | "
+                f"Val ECE: {val_metrics['ece']:.4f}"
+            )
+            epoch_progress.set_postfix(
+                train_loss=f"{train_loss:.4f}",
+                train_acc=f"{train_acc * 100:.2f}%",
+                val_acc=f"{val_metrics['accuracy'] * 100:.2f}%",
+            )
+        else:
+            print(
+                f"Epoch {epoch:3d}/{num_epochs} | "
+                f"Train Loss: {train_loss:.4f} | "
+                f"Train Acc: {train_acc * 100:.2f}%"
+            )
+            epoch_progress.set_postfix(
+                train_loss=f"{train_loss:.4f}",
+                train_acc=f"{train_acc * 100:.2f}%",
+            )
+
+        if run is not None:
+            log_data = {
+                "train/loss": train_loss,
+                "train/accuracy": train_acc,
+                "train/lr": optimizer.param_groups[0]["lr"],
+                "train/epoch": epoch,
+            }
+            if val_metrics is not None:
+                log_data["val/loss"] = val_metrics["loss"]
+                log_data["val/accuracy"] = val_metrics["accuracy"]
+                log_data["val/nll"] = val_metrics["nll"]
+                log_data["val/ece"] = val_metrics["ece"]
+            run.log(log_data)
+
+        if val_metrics is None:
+            continue
+
+        val_acc = val_metrics["accuracy"]
+        if val_acc > best_acc:
+            best_acc = val_acc
+
+        checkpoint_state = {
+            "epoch": epoch,
+            "model_state_dict": model.state_dict(),
+            "optimizer_state_dict": optimizer.state_dict(),
+            "val_metrics": val_metrics,
+            "config": cfg,
+        }
+        if checkpoint_path:
+            update_topk_checkpoints(
+                saved_checkpoints=saved_checkpoints,
+                top_k=top_k,
+                checkpoint_path=checkpoint_path,
+                state=checkpoint_state,
+                metric_name="acc",
+                metric_value=val_acc,
+                epoch=epoch,
+            )
+
+    if saved_checkpoints:
+        print("Saved top checkpoints:")
+        for checkpoint in saved_checkpoints:
+            print(
+                f"  epoch {checkpoint['epoch']:3d} | "
+                f"val acc {checkpoint['metric'] * 100:.2f}% | "
+                f"{checkpoint['path']}"
+            )
+
+    if best_acc >= 0.0:
+        print(f"Best validation accuracy: {best_acc * 100:.2f}%")
+    else:
+        print("Best validation accuracy: not evaluated")
+
+    if run is not None:
+        if best_acc >= 0.0:
+            run.log({"best/val_accuracy": best_acc})
+        if saved_checkpoints:
+            import wandb
+
+            artifact = wandb.Artifact("cifar100_wideresnet_sngp_best_model", type="model")
+            artifact.add_file(str(saved_checkpoints[0]["path"]), name=saved_checkpoints[0]["path"].name)
+            run.log_artifact(artifact)
+        run.finish()
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="CIFAR-100 WideResNet SNGP experiment")
+    parser.add_argument("--config", required=True, help="Path to YAML config file")
+    parser.add_argument("--seed", type=int, default=None, help="Random seed (overrides config)")
+    parser.add_argument("--run-name", type=str, default=None, dest="run_name",
+                        help="W&B run name (overrides config)")
+    args = parser.parse_args()
+
+    with open(args.config) as f:
+        cfg = yaml.safe_load(f)
+
+    if args.seed is not None:
+        cfg.setdefault("training", {})["seed"] = args.seed
+        if cfg.get("output", {}).get("checkpoint_path"):
+            p = Path(cfg["output"]["checkpoint_path"])
+            cfg["output"]["checkpoint_path"] = str(p.parent / f"seed{args.seed}" / p.name)
+    if args.run_name:
+        cfg.setdefault("wandb", {})["run_name"] = args.run_name
+
+    main(cfg)
