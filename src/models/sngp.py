@@ -44,90 +44,80 @@ class SpectralLinear(nn.Module):
         return self.coeff * self.linear(x)
 
 
-class SNGPResidualBlock(nn.Module):
-    expansion = 1
+class WideResNetPreActBlock(nn.Module):
+    """
+    Pre-activation residual block for Wide ResNet with spectral normalization.
+
+    Order: BN -> ReLU -> Conv -> BN -> ReLU -> Conv, with shortcut on raw input.
+    """
 
     def __init__(self, in_channels: int, out_channels: int, stride: int = 1, coeff: float = 0.95):
         super().__init__()
+        self.bn1 = nn.BatchNorm2d(in_channels)
         self.conv1 = SpectralConv2d(
-            in_channels,
-            out_channels,
-            kernel_size=3,
-            stride=stride,
-            padding=1,
-            bias=False,
-            coeff=coeff,
-        )
-        self.bn1 = nn.BatchNorm2d(out_channels)
-        self.conv2 = SpectralConv2d(
-            out_channels,
-            out_channels,
-            kernel_size=3,
-            stride=1,
-            padding=1,
-            bias=False,
-            coeff=coeff,
+            in_channels, out_channels, kernel_size=3, stride=stride, padding=1, bias=False, coeff=coeff
         )
         self.bn2 = nn.BatchNorm2d(out_channels)
+        self.conv2 = SpectralConv2d(
+            out_channels, out_channels, kernel_size=3, stride=1, padding=1, bias=False, coeff=coeff
+        )
 
         if stride != 1 or in_channels != out_channels:
-            self.shortcut = nn.Sequential(
-                SpectralConv2d(
-                    in_channels,
-                    out_channels,
-                    kernel_size=1,
-                    stride=stride,
-                    padding=0,
-                    bias=False,
-                    coeff=coeff,
-                ),
-                nn.BatchNorm2d(out_channels),
+            self.shortcut = SpectralConv2d(
+                in_channels, out_channels, kernel_size=1, stride=stride, padding=0, bias=False, coeff=coeff
             )
         else:
             self.shortcut = nn.Identity()
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        out = F.relu(self.bn1(self.conv1(x)), inplace=True)
-        out = self.bn2(self.conv2(out))
-        out = out + self.shortcut(x)
-        return F.relu(out, inplace=True)
+        out = self.conv1(F.relu(self.bn1(x), inplace=True))
+        out = self.conv2(F.relu(self.bn2(out), inplace=True))
+        return out + self.shortcut(x)
 
 
-class SNGPResNetBackbone(nn.Module):
-    def __init__(self, width: int = 64, hidden_dim: int = 128, coeff: float = 0.95):
+class WideResNet28SNGPBackbone(nn.Module):
+    """
+    Wide ResNet-28-10 backbone with spectral normalization for SNGP.
+
+    Architecture (Liu et al., 2020):
+      - Depth 28 = 6 * 4 + 4  (4 blocks per group, 3 groups)
+      - Widen factor 10: channels [16*10, 32*10, 64*10] = [160, 320, 640]
+      - Pre-activation residual blocks
+      - Spectral normalization on all Conv and Linear layers
+      - Final projection: 640 -> hidden_dim (for GP input)
+    """
+
+    _N_BLOCKS = 4
+    _BASE_CHANNELS = 16
+
+    def __init__(self, widen_factor: int = 10, hidden_dim: int = 128, coeff: float = 0.95):
         super().__init__()
-        self.stem = nn.Sequential(
-            SpectralConv2d(3, width, kernel_size=3, stride=1, padding=1, bias=False, coeff=coeff),
-            nn.BatchNorm2d(width),
-            nn.ReLU(inplace=True),
-        )
-        self.layer1 = self._make_layer(width, width, blocks=2, stride=1, coeff=coeff)
-        self.layer2 = self._make_layer(width, width * 2, blocks=2, stride=2, coeff=coeff)
-        self.layer3 = self._make_layer(width * 2, width * 4, blocks=2, stride=2, coeff=coeff)
-        self.layer4 = self._make_layer(width * 4, width * 8, blocks=2, stride=2, coeff=coeff)
+        base = self._BASE_CHANNELS
+        w = [base * widen_factor, 2 * base * widen_factor, 4 * base * widen_factor]
+
+        self.stem = SpectralConv2d(3, base, kernel_size=3, stride=1, padding=1, bias=False, coeff=coeff)
+        self.group1 = self._make_group(base,    w[0], self._N_BLOCKS, stride=1, coeff=coeff)
+        self.group2 = self._make_group(w[0],    w[1], self._N_BLOCKS, stride=2, coeff=coeff)
+        self.group3 = self._make_group(w[1],    w[2], self._N_BLOCKS, stride=2, coeff=coeff)
+        self.bn_final = nn.BatchNorm2d(w[2])
         self.pool = nn.AdaptiveAvgPool2d((1, 1))
-        self.proj = SpectralLinear(width * 8, hidden_dim, bias=True, coeff=coeff)
+        self.proj = SpectralLinear(w[2], hidden_dim, bias=True, coeff=coeff)
         self.output_dim = hidden_dim
 
-    def _make_layer(
-        self,
-        in_channels: int,
-        out_channels: int,
-        blocks: int,
-        stride: int,
-        coeff: float,
+    def _make_group(
+        self, in_channels: int, out_channels: int, n_blocks: int, stride: int, coeff: float
     ) -> nn.Sequential:
-        layers = [SNGPResidualBlock(in_channels, out_channels, stride=stride, coeff=coeff)]
-        for _ in range(1, blocks):
-            layers.append(SNGPResidualBlock(out_channels, out_channels, stride=1, coeff=coeff))
-        return nn.Sequential(*layers)
+        blocks = [WideResNetPreActBlock(in_channels, out_channels, stride=stride, coeff=coeff)]
+        for _ in range(1, n_blocks):
+            blocks.append(WideResNetPreActBlock(out_channels, out_channels, stride=1, coeff=coeff))
+        return nn.Sequential(*blocks)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         x = self.stem(x)
-        x = self.layer1(x)
-        x = self.layer2(x)
-        x = self.layer3(x)
-        x = self.layer4(x)
+        x = self.group1(x)
+        x = self.group2(x)
+        x = self.group3(x)
+        x = F.relu(self.bn_final(x), inplace=True)
         x = self.pool(x)
         x = torch.flatten(x, 1)
         return self.proj(x)
@@ -156,6 +146,7 @@ class RandomFeatureGaussianProcess(nn.Module):
         input_normalization: str | None = None,
         kernel_scale: float = 1.0,
         length_scale: float = 1.0,
+        optimize_length_scale: bool = False,
     ):
         super().__init__()
         self.in_features = in_features
@@ -170,15 +161,27 @@ class RandomFeatureGaussianProcess(nn.Module):
             input_normalization if input_normalization is not None else ("layer_norm" if normalize_input else "none")
         )
         self.kernel_scale = kernel_scale
-        self.length_scale = length_scale
+        self.optimize_length_scale = optimize_length_scale
 
+        # For normalized_rbf: keep random_weight as N(0,I) and apply length scale
+        # dynamically in _random_features (matches GPyTorch RFFKernel._featurize pattern).
+        # For legacy: scale by 1/sqrt(d) at init as before.
         if kernel_type == "normalized_rbf":
-            random_weight = torch.randn(in_features, num_inducing) / max(length_scale, 1e-12)
+            random_weight = torch.randn(in_features, num_inducing)
         else:
             random_weight = torch.randn(in_features, num_inducing) / math.sqrt(in_features)
 
         self.register_buffer("random_weight", random_weight)
         self.register_buffer("random_bias", 2 * math.pi * torch.rand(num_inducing))
+
+        # log_length_scale: learnable parameter when optimize_length_scale=True, buffer otherwise.
+        # Stored in log-space so exp() always gives a positive value.
+        log_ls = torch.tensor(math.log(max(length_scale, 1e-12)))
+        if optimize_length_scale and kernel_type == "normalized_rbf":
+            self.log_length_scale = nn.Parameter(log_ls)
+        else:
+            self.register_buffer("log_length_scale", log_ls)
+
         self.beta = nn.Linear(num_inducing, out_features, bias=True)
         self.register_buffer(
             "precision_matrix",
@@ -203,7 +206,10 @@ class RandomFeatureGaussianProcess(nn.Module):
     def _random_features(self, x: torch.Tensor) -> torch.Tensor:
         x = self._normalize_features(x)
         if self.kernel_type == "normalized_rbf":
-            projection = x @ self.random_weight + self.random_bias
+            # Divide by length scale dynamically so gradients can flow through log_length_scale
+            # when optimize_length_scale=True. Mirrors GPyTorch RFFKernel._featurize().
+            l = self.log_length_scale.exp()
+            projection = x @ (self.random_weight / l) + self.random_bias
             return self.kernel_scale * math.sqrt(2.0 / self.num_inducing) * torch.cos(projection)
 
         projection = self.feature_scale * (x @ self.random_weight + self.random_bias)
@@ -222,6 +228,48 @@ class RandomFeatureGaussianProcess(nn.Module):
                 batch_precision,
                 alpha=(1.0 - self.gp_cov_momentum),
             )
+
+    def _compute_precision_grad(self, phi: torch.Tensor, logits: torch.Tensor) -> torch.Tensor:
+        """
+        Differentiable re-estimate of the precision matrix on the given batch.
+
+        Unlike _update_precision (which is @no_grad and accumulates into a buffer),
+        this version stays in the autograd graph so gradients can flow through it
+        to log_length_scale during the MML optimization step.
+
+        Returns shape: (out_features, num_inducing, num_inducing)
+        """
+        probs = logits.softmax(dim=-1)
+        prob_mult = probs * (1.0 - probs)
+        precision = torch.einsum("bk,bi,bj->kij", prob_mult, phi, phi)
+        eye = torch.eye(self.num_inducing, device=phi.device, dtype=phi.dtype).unsqueeze(0)
+        return precision + self.ridge_penalty * eye
+
+    def compute_laplace_log_mml(self, x: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
+        """
+        Laplace approximation to the log marginal likelihood w.r.t. log_length_scale.
+
+            log p(Y | X, l) ≈ log p(Y | θ_MAP) − ½ Σ_k log|P_k(l)|
+
+        Returns the *negative* log MML (scalar) so it can be minimized directly.
+        Gradients flow through log_length_scale via _random_features.
+        """
+        phi = self._random_features(x)   # differentiable w.r.t. log_length_scale
+        logits = self.beta(phi)
+
+        ce_term = -F.cross_entropy(logits, labels, reduction="sum")
+        precision = self._compute_precision_grad(phi, logits)  # [K, D, D]
+
+        # log|P_k| via Cholesky — numerically stable and differentiable
+        try:
+            L = torch.linalg.cholesky(precision)
+            log_det = 2.0 * L.diagonal(dim1=-2, dim2=-1).log().sum(dim=-1)  # [K]
+        except torch.linalg.LinAlgError:
+            sign, log_det = torch.linalg.slogdet(precision)
+            log_det = log_det * sign.clamp(min=0)
+
+        log_mml = ce_term - 0.5 * log_det.sum()
+        return -log_mml  # return negative for minimization
 
     def forward(
         self,
@@ -261,10 +309,16 @@ def laplace_predictive_probs(
 
 
 class SNGPResNetClassifier(nn.Module):
+    """
+    Wide ResNet-28-10 with spectral normalization + Random Feature GP head.
+
+    Implements the SNGP model from Liu et al. (2020) for CIFAR-scale inputs.
+    """
+
     def __init__(
         self,
         num_classes: int = 10,
-        width: int = 64,
+        widen_factor: int = 10,
         hidden_dim: int = 128,
         spec_norm_bound: float = 0.95,
         num_inducing: int = 1024,
@@ -272,10 +326,15 @@ class SNGPResNetClassifier(nn.Module):
         feature_scale: float = 2.0,
         gp_cov_momentum: float = -1.0,
         normalize_input: bool = False,
+        kernel_type: str = "legacy",
+        input_normalization: str | None = None,
+        kernel_scale: float = 1.0,
+        length_scale: float = 1.0,
+        optimize_length_scale: bool = False,
     ):
         super().__init__()
-        self.backbone = SNGPResNetBackbone(
-            width=width,
+        self.backbone = WideResNet28SNGPBackbone(
+            widen_factor=widen_factor,
             hidden_dim=hidden_dim,
             coeff=spec_norm_bound,
         )
@@ -287,6 +346,11 @@ class SNGPResNetClassifier(nn.Module):
             feature_scale=feature_scale,
             gp_cov_momentum=gp_cov_momentum,
             normalize_input=normalize_input,
+            kernel_type=kernel_type,
+            input_normalization=input_normalization,
+            kernel_scale=kernel_scale,
+            length_scale=length_scale,
+            optimize_length_scale=optimize_length_scale,
         )
 
     def reset_precision_matrix(self) -> None:

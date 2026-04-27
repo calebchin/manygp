@@ -28,7 +28,7 @@ def load_frozen_resnet_encoder(
 ) -> CifarResNetEncoder:
     checkpoint = torch.load(Path(checkpoint_path), map_location=device)
     state_dict = checkpoint.get("model_state_dict", checkpoint)
-    encoder = CifarResNetEncoder(width=width, embedding_dim=embedding_dim).to(device)
+    encoder = CifarResNetEncoder(widen_factor=width, embedding_dim=embedding_dim).to(device)
     encoder.load_state_dict(_extract_encoder_state_dict(state_dict))
     encoder.eval()
     for param in encoder.parameters():
@@ -60,6 +60,7 @@ class FrozenBackboneSNGPClassifier(nn.Module):
         input_normalization: str = "l2",
         kernel_scale: float = 1.0,
         length_scale: float = 1.0,
+        optimize_length_scale: bool = False,
     ):
         super().__init__()
         self.encoder = encoder
@@ -86,6 +87,7 @@ class FrozenBackboneSNGPClassifier(nn.Module):
             input_normalization=input_normalization,
             kernel_scale=kernel_scale,
             length_scale=length_scale,
+            optimize_length_scale=optimize_length_scale,
         )
 
     def reset_precision_matrix(self) -> None:
@@ -93,6 +95,7 @@ class FrozenBackboneSNGPClassifier(nn.Module):
 
     @torch.no_grad()
     def encode_backbone(self, x: torch.Tensor) -> torch.Tensor:
+        self.encoder.eval()
         return self.encoder(x)
 
     def encode(self, x: torch.Tensor) -> torch.Tensor:

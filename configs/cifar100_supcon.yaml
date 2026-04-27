@@ -1,0 +1,34 @@
+experiment:
+  name: cifar100_supcon
+  smoke_test: false
+
+data:
+  root: ../datafolder/data
+  batch_size: 256
+  num_workers: 4
+
+model:
+  embedding_dim: 128
+  projection_dim: 128
+  projection_hidden_dim: 256
+  width: 64
+
+training:
+  epochs: 100
+  eval_interval: 5
+  log_every_steps: 20
+  lr: 0.001
+  weight_decay: 0.0001
+  supcon_temperature: 0.07
+  knn_k: 20
+  knn_temperature: 0.1
+
+output:
+  checkpoint_path: ./checkpoints_supcon/cifar100_supcon_best.pt
+  top_k: 10
+
+wandb:
+  enabled: true
+  project: sngp
+  entity: sta414manygp
+  run_name: cifar100_supcon

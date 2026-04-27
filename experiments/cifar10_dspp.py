@@ -50,13 +50,14 @@ def main(cfg: dict, config_path: str) -> None:
         run.log_artifact(config_artifact)
 
     # ── Data ──────────────────────────────────────────────────────────────────
-    train_loader, test_loader, dataset_train, dataset_test = get_cifar10_loaders(
+    train_loader, _, test_loader, dataset_train, _, dataset_test = get_cifar10_loaders(
         data_root=cfg["data"]["root"],
         batch_size=cfg["data"]["batch_size"],
         num_workers=cfg["data"]["num_workers"],
         smoke_test=smoke_test,
     )
     print(f"Train size: {len(dataset_train)}, test size: {len(dataset_test)}")
+    test_y = torch.cat([y for _, y in test_loader])
 
     # ── CNN pretraining ───────────────────────────────────────────────────────
     cnn_cfg = cfg["cnn"]
@@ -130,10 +131,13 @@ def main(cfg: dict, config_path: str) -> None:
         device=device,
         cnn=cnn,
         run=run,
+        eval_loader=test_loader,
+        eval_y=test_y,
+        eval_every=train_cfg.get("eval_every", 5),
     )
 
     # ── Evaluation ────────────────────────────────────────────────────────────
-    metrics = evaluate_classifier(dspp, test_loader, cnn=cnn, device=device, run=run)
+    metrics = evaluate_classifier(dspp, test_loader, test_y=test_y, feature_extractor=cnn, dataset_name="cifar10", device=device, run=run)
     print(f"Test Accuracy: {metrics['accuracy'] * 100:.2f}%")
     print(f"Test NLL:      {metrics['nll']:.4f} nats")
 
@@ -153,9 +157,13 @@ def main(cfg: dict, config_path: str) -> None:
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="CIFAR-10 DSPP experiment")
     parser.add_argument("--config", required=True, help="Path to YAML config file")
+    parser.add_argument("--run-name", default=None, help="W&B run name (overrides config)")
     args = parser.parse_args()
 
     with open(args.config) as f:
         cfg = yaml.safe_load(f)
+
+    if args.run_name is not None:
+        cfg.setdefault("wandb", {})["run_name"] = args.run_name
 
     main(cfg, config_path=args.config)

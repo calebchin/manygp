@@ -25,6 +25,6 @@ output:
 
 wandb:
   enabled: true
-  project: sngp
+  project: Updated_run
   entity: sta414manygp
   run_name: vanilla_dnn

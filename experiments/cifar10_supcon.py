@@ -113,15 +113,7 @@ def main(cfg: dict) -> None:
         )
 
     data_cfg = cfg["data"]
-    (
-        train_loader,
-        memory_loader,
-        val_loader,
-        val_supcon_loader,
-        train_dataset,
-        val_dataset,
-        val_supcon_dataset,
-    ) = get_cifar10_supcon_loaders(
+    train_loader, memory_loader, val_loader, test_loader, train_dataset, val_dataset, test_dataset = get_cifar10_supcon_loaders(
         data_root=data_cfg["root"],
         batch_size=data_cfg["batch_size"],
         num_workers=data_cfg["num_workers"],
@@ -130,7 +122,7 @@ def main(cfg: dict) -> None:
     print(
         f"Train size: {len(train_dataset)}, "
         f"val size: {len(val_dataset)}, "
-        f"val supcon size: {len(val_supcon_dataset)}"
+        f"test size: {len(test_dataset)}"
     )
 
     model_cfg = cfg["model"]

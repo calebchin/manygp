@@ -27,12 +27,15 @@ def get_svhn_loader(
     """
     Returns a DataLoader for SVHN, normalized with the ID dataset's mean/std.
 
+    SVHN images are 32x32 (same spatial size as CIFAR), so no resizing is needed.
+    torchvision.datasets.SVHN downloads automatically if not present.
+
     Args:
         data_root:        Directory to download / read SVHN from.
         batch_size:       Mini-batch size.
         num_workers:      DataLoader worker processes.
-        id_normalization: "cifar10" or "cifar100".
-        split:            "test" (default), "train", or "extra".
+        id_normalization: "cifar10" or "cifar100"; which normalization to apply.
+        split:            "test" (default) or "train" or "extra".
 
     Returns:
         DataLoader yielding (images, labels).

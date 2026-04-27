@@ -3,8 +3,58 @@ from __future__ import annotations
 from typing import Dict, Tuple
 
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
 from tqdm.auto import tqdm
+
+
+class NTXentLoss(nn.Module):
+    """Normalized temperature-scaled cross entropy loss for SimCLR.
+
+    Reference: Chen et al., "A Simple Framework for Contrastive Learning
+    of Visual Representations" (https://arxiv.org/abs/2002.05709).
+    """
+
+    def __init__(self, temperature: float = 0.5):
+        super().__init__()
+        self.temperature = temperature
+
+    def forward(self, z1: torch.Tensor, z2: torch.Tensor) -> torch.Tensor:
+        """Compute NT-Xent loss over two views of a batch.
+
+        Args:
+            z1: Projections from view 1, shape (B, D).
+            z2: Projections from view 2, shape (B, D).
+
+        Returns:
+            Scalar loss averaged over both directions.
+        """
+        batch_size = z1.size(0)
+        device = z1.device
+
+        z1 = F.normalize(z1, dim=1)
+        z2 = F.normalize(z2, dim=1)
+
+        # (2B, D) — first B rows are view-1, last B rows are view-2
+        z = torch.cat([z1, z2], dim=0)
+
+        # Cosine similarity matrix (2B, 2B), scaled by temperature
+        sim = (z @ z.T) / self.temperature
+
+        # Mask out self-similarity on diagonal
+        mask = torch.eye(2 * batch_size, device=device, dtype=torch.bool)
+        sim = sim.masked_fill(mask, float("-inf"))
+
+        # Positive-pair indices: view-1[i] pairs with view-2[i] = row i → col i+B
+        #                        view-2[i] pairs with view-1[i] = row i+B → col i
+        labels = torch.cat(
+            [torch.arange(batch_size, 2 * batch_size, device=device),
+             torch.arange(batch_size, device=device)],
+            dim=0,
+        )
+
+        loss = F.cross_entropy(sim, labels)
+        return loss
 
 
 class SupConLoss(torch.nn.Module):

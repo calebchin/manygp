@@ -1,0 +1,31 @@
+experiment:
+  name: cifar10_ood_eval
+
+model:
+  # Path to the best trained CIFAR-10 checkpoint (written by training scripts).
+  # Replace <model> with: checkpoints_sngp, checkpoints_supcon_sngp, or checkpoints_ensemble_cifar10
+  checkpoint_path: ./checkpoints_sngp/best_model.pt
+  num_mc_samples: 10
+
+data:
+  root: ../datafolder/data
+  batch_size: 256
+  num_workers: 4
+
+ood:
+  # Root directory where CIFAR-10-C/ will be placed (auto-downloaded if absent).
+  cifarc_root: ../datafolder/data
+  # Set to a list to evaluate a subset, e.g. [gaussian_noise, fog].
+  # null = evaluate all 15 corruption types.
+  corruptions: null
+  severities: [1, 2, 3, 4, 5]
+
+output:
+  results_path: ./results/cifar10_ood_eval.json
+  csv_path: ./results/cifar10_ood_cifarc.csv
+
+wandb:
+  enabled: true
+  project: Updated_run
+  entity: sta414manygp
+  run_name: cifar10_ood_eval

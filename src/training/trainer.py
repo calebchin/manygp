@@ -4,6 +4,7 @@ import numpy as np
 import torch
 from scipy.cluster.vq import kmeans2
 from tqdm.auto import tqdm
+from src.training.evaluate import evaluate_classifier
 
 
 def init_inducing_points_kmeans(data_tensor: torch.Tensor, n_points: int) -> torch.Tensor:
@@ -109,6 +110,9 @@ def train_dspp(
     device,
     cnn=None,
     run=None,
+    eval_loader=None,
+    eval_y=None,
+    eval_every: int = 5,
 ) -> List[float]:
     """
     Train a DSPP model with Adam + MultiStepLR.
@@ -161,8 +165,15 @@ def train_dspp(
         if run is not None:
             run.log({
                 "train/loss": avg_loss,
-                "train/epoch": epoch + 1,
                 "train/lr": scheduler.get_last_lr()[0],
+                "train/epoch": epoch + 1,
             })
+
+        if eval_loader is not None and eval_y is not None and (epoch + 1) % eval_every == 0:
+            metrics = evaluate_classifier(model, eval_loader, test_y=eval_y, feature_extractor=cnn, dataset_name="cifar10", device=device, run=None)
+            print(f"  Eval | Accuracy: {metrics['accuracy'] * 100:.2f}% | NLL: {metrics['nll']:.4f} | ECE: {metrics['ece']:.4f}")
+            if run is not None:
+                run.log({"eval/accuracy": metrics["accuracy"], "eval/nll": metrics["nll"], "eval/ece": metrics["ece"], "train/epoch": epoch + 1})
+            model.train()
 
     return epoch_losses
