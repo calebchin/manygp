@@ -14,6 +14,12 @@ from sklearn.metrics import average_precision_score, roc_auc_score
 from sklearn.mixture import GaussianMixture
 from torch.utils.data import DataLoader
 
+try:
+    from tqdm.auto import tqdm
+except ImportError:
+    def tqdm(iterable, *args, **kwargs):
+        return iterable
+
 from src.data.cifar10 import get_cifar10_eval_transform
 from src.data.cifar100 import get_cifar100_loaders
 from src.data.svhn import get_svhn_loader
@@ -196,6 +202,7 @@ def collect_embeddings(
     loader: DataLoader,
     device: torch.device,
     num_mc_samples: int = 10,
+    split_name: str | None = None,
 ) -> dict[str, np.ndarray]:
     embeddings: list[torch.Tensor] = []
     labels: list[torch.Tensor] = []
@@ -205,7 +212,15 @@ def collect_embeddings(
     variances: list[torch.Tensor] = []
     precision_inv = torch.linalg.pinv(model.classifier.precision_matrix)
 
-    for images, batch_labels in loader:
+    batch_iterator = tqdm(
+        loader,
+        total=len(loader),
+        desc=f"Batches:{split_name}" if split_name is not None else "Batches",
+        unit="batch",
+        leave=False,
+        dynamic_ncols=True,
+    )
+    for images, batch_labels in batch_iterator:
         images = images.to(device, non_blocking=True)
         batch_labels = batch_labels.to(device, non_blocking=True)
 
@@ -272,12 +287,21 @@ def extract_embeddings_for_checkpoint(
     num_mc_samples = cfg.get("training", {}).get("num_mc_samples", 10)
 
     split_outputs: dict[str, dict[str, np.ndarray]] = {}
-    for split_name, loader in loaders.items():
+    split_items = tqdm(
+        loaders.items(),
+        total=len(loaders),
+        desc=f"Splits:{checkpoint_path.stem}",
+        unit="split",
+        leave=False,
+        dynamic_ncols=True,
+    )
+    for split_name, loader in split_items:
         split_outputs[split_name] = collect_embeddings(
             model=model,
             loader=loader,
             device=device,
             num_mc_samples=num_mc_samples,
+            split_name=split_name,
         )
 
     cifar10_test_probs = split_outputs["cifar10_test"]["probs"]
@@ -645,21 +669,33 @@ def evaluate_checkpoint_from_embeddings(
         "cifar100": embeddings.cifar100_test,
     }
     for dataset_name, dataset_split in ood_specs.items():
-        label_metrics = compute_ood_metrics(-train_fit_test_gmm["log_px"], -gmm_probabilities(
+        label_ood_gmm = gmm_probabilities(
             dataset_split.embeddings,
             train_fit_priors,
             train_fit_means,
             train_fit_covariances,
-        )["log_px"])
+        )
+        label_metrics = compute_ood_metrics(-train_fit_test_gmm["log_px"], -label_ood_gmm["log_px"])
         rows.update(flatten_metric_dict(f"{dataset_name}_label_gmm", label_metrics))
+        label_mp_metrics = compute_ood_metrics(
+            max_prob_uncertainty(train_fit_test_gmm["posterior"]),
+            max_prob_uncertainty(label_ood_gmm["posterior"]),
+        )
+        rows.update(flatten_metric_dict(f"{dataset_name}_label_gmm_mp", label_mp_metrics))
 
-        em_metrics = compute_ood_metrics(-em_test_gmm["log_px"], -gmm_probabilities(
+        em_ood_gmm = gmm_probabilities(
             dataset_split.embeddings,
             em_priors,
             em_means,
             em_covariances,
-        )["log_px"])
+        )
+        em_metrics = compute_ood_metrics(-em_test_gmm["log_px"], -em_ood_gmm["log_px"])
         rows.update(flatten_metric_dict(f"{dataset_name}_em_gmm", em_metrics))
+        em_mp_metrics = compute_ood_metrics(
+            max_prob_uncertainty(em_test_gmm["posterior"]),
+            max_prob_uncertainty(em_ood_gmm["posterior"]),
+        )
+        rows.update(flatten_metric_dict(f"{dataset_name}_em_gmm_mp", em_mp_metrics))
 
         ds_metrics = compute_ood_metrics(
             dempster_shafer_uncertainty(embeddings.test.logits),
@@ -672,6 +708,7 @@ def evaluate_checkpoint_from_embeddings(
             max_prob_uncertainty(dataset_split.probs),
         )
         rows.update(flatten_metric_dict(f"{dataset_name}_max_prob", mp_metrics))
+        rows.update(flatten_metric_dict(f"{dataset_name}_mp", mp_metrics))
 
     return rows
 

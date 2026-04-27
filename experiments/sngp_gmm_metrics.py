@@ -6,6 +6,12 @@ from pathlib import Path
 
 import torch
 
+try:
+    from tqdm.auto import tqdm
+except ImportError:
+    def tqdm(iterable, *args, **kwargs):
+        return iterable
+
 REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
@@ -129,7 +135,15 @@ def run_evaluations(args: argparse.Namespace) -> tuple[list[dict[str, object]], 
     device = resolve_device(args.device)
 
     metric_rows: list[dict[str, object]] = []
-    for checkpoint_path in checkpoint_paths:
+    checkpoint_iterator = tqdm(
+        checkpoint_paths,
+        desc="Checkpoints",
+        unit="ckpt",
+        dynamic_ncols=True,
+    )
+    for checkpoint_path in checkpoint_iterator:
+        if hasattr(checkpoint_iterator, "set_postfix_str"):
+            checkpoint_iterator.set_postfix_str(checkpoint_path.stem)
         row, _ = evaluate_checkpoint_path(
             checkpoint_path=checkpoint_path,
             output_dir=output_dir,
