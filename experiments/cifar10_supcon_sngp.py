@@ -6,6 +6,7 @@ robustness evaluation in the same W&B run.
 
 Usage:
     python experiments/cifar10_supcon_sngp.py --config configs/cifar10_supcon_sngp.yaml
+    python experiments/cifar10_supcon_sngp.py --config configs/cifar10_supcon_sngp.yaml --supcon-loss-weight 0.5
 """
 
 from __future__ import annotations
@@ -14,11 +15,15 @@ import argparse
 import copy
 import itertools
 import os
+import random
 import sys
 from datetime import datetime
 from pathlib import Path
+from uuid import uuid4
 
+import numpy as np
 import torch
+import torch.nn.functional as F
 import yaml
 from tqdm.auto import tqdm
 
@@ -34,10 +39,21 @@ from src.utils.model_loader import ModelWrapper
 from src.utils.model_summary import print_model_summary
 
 
+def set_seed(seed: int) -> None:
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+
+
 def resolve_timestamped_checkpoint_path(checkpoint_path: str) -> str:
     checkpoint_target = Path(checkpoint_path)
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    return str(checkpoint_target.parent / timestamp / checkpoint_target.name)
+    random_suffix = uuid4().hex[:8]
+    return str(checkpoint_target.parent / f"{timestamp}_{random_suffix}" / checkpoint_target.name)
 
 
 def update_topk_checkpoints(
@@ -215,9 +231,9 @@ def evaluate_joint_sngp(
     num_mc_samples: int = 10,
 ) -> dict[str, float]:
     model.eval()
-    running_loss = 0.0
     total_correct = 0
     total_examples = 0
+    total_ce_loss = 0.0
     total_nll = 0.0
     all_probs: list[torch.Tensor] = []
     all_labels: list[torch.Tensor] = []
@@ -229,9 +245,8 @@ def evaluate_joint_sngp(
         logits, variances = model(images, return_cov=True)
         probs = laplace_predictive_probs(logits, variances, num_mc_samples=num_mc_samples)
         log_probs = probs.clamp_min(1e-12).log()
-        loss = -log_probs.gather(1, labels.unsqueeze(1)).mean()
+        total_ce_loss += F.cross_entropy(logits, labels, reduction="sum").item()
 
-        running_loss += loss.item()
         total_correct += (probs.argmax(dim=1) == labels).sum().item()
         total_examples += labels.size(0)
         total_nll += -log_probs.gather(1, labels.unsqueeze(1)).sum().item()
@@ -243,15 +258,21 @@ def evaluate_joint_sngp(
     ece = _classification_ece(all_probs_t, all_labels_t)
 
     return {
-        "loss":     running_loss / len(loader),
+        "loss": total_nll / total_examples,
         "accuracy": total_correct / total_examples,
-        "nll":      total_nll / total_examples,
+        "ce_loss": total_ce_loss / total_examples,
+        "nll": total_nll / total_examples,
         "ece":      ece,
     }
 
 
 def main(cfg: dict) -> None:
     smoke_test = cfg["experiment"]["smoke_test"]
+    seed = cfg["experiment"].get("seed")
+    if seed is not None:
+        set_seed(seed)
+        print(f"Seed: {seed}")
+
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Device: {device}")
 
@@ -320,6 +341,7 @@ def main(cfg: dict) -> None:
     ce_loss_fn = torch.nn.CrossEntropyLoss()
 
     best_val_acc = -1.0
+    best_val_nll = float("inf")
     num_epochs = 1 if smoke_test else train_cfg["epochs"]
     eval_interval = 1 if smoke_test else train_cfg.get("eval_interval", 1)
     log_every_steps = train_cfg.get("log_every_steps", None)
@@ -395,12 +417,14 @@ def main(cfg: dict) -> None:
                 f"Train CE: {train_metrics['ce_loss']:.4f} | "
                 f"Train Acc: {train_metrics['accuracy'] * 100:.2f}% | "
                 f"Val Acc: {val_metrics['accuracy'] * 100:.2f}% | "
+                f"Val CE: {val_metrics['ce_loss']:.4f} | "
                 f"Val NLL: {val_metrics['nll']:.4f}"
             )
             epoch_progress.set_postfix(
                 train_total=f"{train_metrics['total_loss']:.4f}",
                 train_acc=f"{train_metrics['accuracy'] * 100:.2f}%",
                 val_acc=f"{val_metrics['accuracy'] * 100:.2f}%",
+                val_nll=f"{val_metrics['nll']:.4f}",
             )
         else:
             print(
@@ -423,8 +447,11 @@ def main(cfg: dict) -> None:
                 "train/epoch":       epoch,
             }
             if val_metrics is not None:
-                log_data.update({"val/loss": val_metrics["loss"], "val/accuracy": val_metrics["accuracy"],
-                                 "val/nll": val_metrics["nll"], "val/ece": val_metrics["ece"]})
+                log_data["val/loss"] = val_metrics["loss"]
+                log_data["val/accuracy"] = val_metrics["accuracy"]
+                log_data["val/ce_loss"] = val_metrics["ce_loss"]
+                log_data["val/nll"] = val_metrics["nll"]
+                log_data["val/ece"] = val_metrics["ece"]
             run.log(log_data)
 
         if val_metrics is None:
@@ -432,6 +459,7 @@ def main(cfg: dict) -> None:
 
         if val_metrics["accuracy"] > best_val_acc:
             best_val_acc = val_metrics["accuracy"]
+        best_val_nll = min(best_val_nll, val_metrics["nll"])
         checkpoint_state = {
             "epoch": epoch,
             "model_state_dict": model.state_dict(),
@@ -490,9 +518,16 @@ def main(cfg: dict) -> None:
                 cfg=cfg, device=device, run=run, num_mc_samples=num_mc_samples, model_type="supcon_sngp",
             )
 
+    if best_val_nll < float("inf"):
+        print(f"Best validation NLL: {best_val_nll:.4f}")
+    else:
+        print("Best validation NLL: not evaluated")
+
     if run is not None:
         if best_val_acc >= 0.0:
             run.log({"best/val_accuracy": best_val_acc})
+        if best_val_nll < float("inf"):
+            run.log({"best/val_nll": best_val_nll})
         if saved_checkpoints:
             run.log({f"best/{checkpoint_metric}": saved_checkpoints[0]["metric"]})
             import wandb
@@ -505,6 +540,12 @@ def main(cfg: dict) -> None:
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="CIFAR-10 joint SupCon + SNGP training")
     parser.add_argument("--config", required=True, help="Path to YAML config file")
+    parser.add_argument(
+        "--supcon-loss-weight",
+        type=float,
+        default=None,
+        help="Optional override for training.supcon_loss_weight",
+    )
     parser.add_argument("--seed", type=int, default=None, help="Random seed (overrides config)")
     parser.add_argument("--run-name", type=str, default=None, dest="run_name",
                         help="W&B run name (overrides config)")
@@ -513,6 +554,8 @@ if __name__ == "__main__":
     with open(args.config) as f:
         cfg = yaml.safe_load(f)
 
+    if args.supcon_loss_weight is not None:
+        cfg.setdefault("training", {})["supcon_loss_weight"] = args.supcon_loss_weight
     if args.seed is not None:
         cfg.setdefault("training", {})["seed"] = args.seed
         if cfg.get("output", {}).get("checkpoint_path"):

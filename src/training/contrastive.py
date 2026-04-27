@@ -218,3 +218,27 @@ def evaluate_knn(
         temperature=temperature,
     )
     return {"knn_accuracy": accuracy}
+
+
+@torch.no_grad()
+def evaluate_supcon_loss(
+    model: torch.nn.Module,
+    loader,
+    loss_fn: SupConLoss,
+    device: torch.device,
+) -> Dict[str, float]:
+    model.eval()
+    total_loss = 0.0
+    total_examples = 0
+
+    for views, labels in loader:
+        labels = labels.to(device, non_blocking=True)
+        batch_size, num_views, channels, height, width = views.shape
+        views = views.to(device, non_blocking=True).view(batch_size * num_views, channels, height, width)
+        projections = model(views).view(batch_size, num_views, -1)
+        loss = loss_fn(projections, labels)
+
+        total_loss += loss.item() * batch_size
+        total_examples += batch_size
+
+    return {"supcon_loss": total_loss / total_examples}

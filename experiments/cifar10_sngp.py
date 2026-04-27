@@ -9,23 +9,34 @@ Usage:
 """
 
 import argparse
+import copy
 import itertools
 import os
 import sys
+from datetime import datetime
 from pathlib import Path
+from uuid import uuid4
 
+import numpy as np
 import torch
 import yaml
 from tqdm.auto import tqdm
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from src.data.cifar10 import get_cifar10_loaders
+from src.data.cifar10 import get_cifar10_loaders, get_cifar10_two_view_classification_loaders
 from src.models.sngp import SNGPResNetClassifier, laplace_predictive_probs
 from src.training.evaluate import _classification_ece
 from src.training.ood_evaluate import collect_logits_and_probs
 from src.utils.model_loader import ModelWrapper
 from src.utils.model_summary import print_model_summary
+
+
+def resolve_timestamped_checkpoint_path(checkpoint_path: str) -> str:
+    checkpoint_target = Path(checkpoint_path)
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    random_suffix = uuid4().hex[:8]
+    return str(checkpoint_target.parent / f"{timestamp}_{random_suffix}" / checkpoint_target.name)
 
 
 def update_topk_checkpoints(
@@ -96,6 +107,10 @@ def train_epoch(
     for images, labels in progress:
         images = images.to(device, non_blocking=True)
         labels = labels.to(device, non_blocking=True)
+        if images.ndim == 5:
+            batch_size, num_views, channels, height, width = images.shape
+            images = images.view(batch_size * num_views, channels, height, width)
+            labels = labels.repeat_interleave(num_views)
 
         optimizer.zero_grad(set_to_none=True)
         logits = model(images, update_precision=True)
@@ -168,7 +183,11 @@ def rebuild_precision_matrix(
     model.train()
     with torch.no_grad():
         for images, _ in train_loader:
-            model(images.to(device), update_precision=True)
+            images = images.to(device)
+            if images.ndim == 5:
+                batch_size, num_views, channels, height, width = images.shape
+                images = images.view(batch_size * num_views, channels, height, width)
+            model(images, update_precision=True)
 
 
 @torch.no_grad()
@@ -221,7 +240,6 @@ def main(cfg: dict) -> None:
     seed = cfg.get("training", {}).get("seed", None)
     if seed is not None:
         import random
-        import numpy as np
         random.seed(seed)
         np.random.seed(seed)
         torch.manual_seed(seed)
@@ -241,13 +259,37 @@ def main(cfg: dict) -> None:
         )
 
     data_cfg = cfg["data"]
-    train_loader, val_loader, test_loader, train_dataset, val_dataset, test_dataset = get_cifar10_loaders(
-        data_root=data_cfg["root"],
-        batch_size=data_cfg["batch_size"],
-        num_workers=data_cfg["num_workers"],
-        smoke_test=smoke_test,
-    )
+    train_dataset_name = data_cfg.get("train_dataset")
+    if train_dataset_name is None:
+        train_dataset_name = "supcon_two_view" if data_cfg.get("use_supcon_augmentations", False) else "standard"
+
+    if train_dataset_name == "supcon_two_view":
+        train_loader, val_loader, train_dataset, val_dataset = get_cifar10_two_view_classification_loaders(
+            data_root=data_cfg["root"],
+            batch_size=data_cfg["batch_size"],
+            num_workers=data_cfg["num_workers"],
+            smoke_test=smoke_test,
+        )
+        _, _, test_loader, _, _, test_dataset = get_cifar10_loaders(
+            data_root=data_cfg["root"],
+            batch_size=data_cfg["batch_size"],
+            num_workers=data_cfg["num_workers"],
+            smoke_test=smoke_test,
+        )
+    elif train_dataset_name == "standard":
+        train_loader, val_loader, test_loader, train_dataset, val_dataset, test_dataset = get_cifar10_loaders(
+            data_root=data_cfg["root"],
+            batch_size=data_cfg["batch_size"],
+            num_workers=data_cfg["num_workers"],
+            smoke_test=smoke_test,
+        )
+    else:
+        raise ValueError(
+            f"Unsupported data.train_dataset={train_dataset_name!r}. "
+            "Expected one of: 'standard', 'supcon_two_view'."
+        )
     print(f"Train: {len(train_dataset)}  Val: {len(val_dataset)}  Test: {len(test_dataset)}")
+    print(f"Training dataset: {train_dataset_name}")
 
     model_cfg = cfg["model"]
     model = SNGPResNetClassifier(
@@ -281,17 +323,26 @@ def main(cfg: dict) -> None:
     loss_fn = torch.nn.CrossEntropyLoss()
 
     best_acc = -1.0
+    best_nll = float("inf")
+    best_ece = float("inf")
     num_epochs = 1 if smoke_test else train_cfg["epochs"]
     eval_interval = 1 if smoke_test else train_cfg.get("eval_interval", 1)
     log_every_steps = train_cfg.get("log_every_steps", None)
     num_mc_samples = train_cfg.get("num_mc_samples", 10)
     output_cfg = cfg.get("output", {})
     checkpoint_path = output_cfg.get("checkpoint_path")
+    resolved_checkpoint_path = resolve_timestamped_checkpoint_path(checkpoint_path) if checkpoint_path else None
     top_k = output_cfg.get("top_k", 1)
     checkpoint_metric = output_cfg.get("checkpoint_metric", "val_ece")
     lower_is_better = checkpoint_metric in ("val_ece", "val_loss")
     saved_checkpoints: list[dict] = []
     global_step = 0
+
+    if resolved_checkpoint_path is not None:
+        print(f"Checkpoint directory: {Path(resolved_checkpoint_path).parent}")
+
+    runtime_cfg = copy.deepcopy(cfg)
+    runtime_cfg.setdefault("output", {})["resolved_checkpoint_path"] = resolved_checkpoint_path
 
     # MML optimizer setup (only active when optimize_length_scale=True in model config)
     mml_cfg = cfg.get("mml", {})
@@ -375,26 +426,34 @@ def main(cfg: dict) -> None:
 
         if val_acc > best_acc:
             best_acc = val_acc
+        if val_nll is not None:
+            best_nll = min(best_nll, val_nll)
+        if val_ece is not None:
+            best_ece = min(best_ece, val_ece)
         checkpoint_state = {
             "epoch": epoch,
             "model_state_dict": model.state_dict(),
             "optimizer_state_dict": optimizer.state_dict(),
             "val_accuracy": val_acc, "val_loss": val_loss, "val_nll": val_nll, "val_ece": val_ece,
-            "config": cfg,
+            "config": runtime_cfg,
             "log_length_scale": model.classifier.log_length_scale.item(),
         }
-        if checkpoint_path:
+        if resolved_checkpoint_path:
             _metric_map = {"val_ece": val_ece, "val_loss": val_loss, "val_accuracy": val_acc}
             _ckpt_val = _metric_map.get(checkpoint_metric, val_ece)
             update_topk_checkpoints(
                 saved_checkpoints=saved_checkpoints, top_k=top_k,
-                checkpoint_path=checkpoint_path, state=checkpoint_state,
+                checkpoint_path=resolved_checkpoint_path, state=checkpoint_state,
                 metric_name=checkpoint_metric.replace("val_", ""), metric_value=_ckpt_val, epoch=epoch,
                 lower_is_better=lower_is_better,
             )
 
     if best_acc >= 0.0:
         print(f"Best validation accuracy: {best_acc * 100:.2f}%")
+    if best_nll < float("inf"):
+        print(f"Best validation NLL: {best_nll:.4f}")
+    if best_ece < float("inf"):
+        print(f"Best validation ECE: {best_ece:.4f}")
 
     # ── Test evaluation + OOD/CIFAR-C (same W&B run) ─────────────────────────
     test_metrics: dict[str, float] | None = None
@@ -436,6 +495,10 @@ def main(cfg: dict) -> None:
     if run is not None:
         if best_acc >= 0.0:
             run.log({"best/val_accuracy": best_acc})
+        if best_nll < float("inf"):
+            run.log({"best/val_nll": best_nll})
+        if best_ece < float("inf"):
+            run.log({"best/val_ece": best_ece})
         if saved_checkpoints:
             run.log({f"best/{checkpoint_metric}": saved_checkpoints[0]["metric"]})
             import wandb
@@ -448,6 +511,18 @@ def main(cfg: dict) -> None:
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="CIFAR-10 SNGP experiment")
     parser.add_argument("--config", required=True, help="Path to YAML config file")
+    parser.add_argument(
+        "--train-dataset",
+        choices=("standard", "supcon_two_view"),
+        default=None,
+        help="Override data.train_dataset",
+    )
+    parser.add_argument(
+        "--use-supcon-augmentations",
+        type=lambda x: x.lower() == "true",
+        default=None,
+        help="Backward-compatible override mapped to data.train_dataset",
+    )
     parser.add_argument("--seed", type=int, default=None, help="Random seed (overrides config)")
     parser.add_argument("--run-name", type=str, default=None, dest="run_name",
                         help="W&B run name (overrides config)")
@@ -456,6 +531,12 @@ if __name__ == "__main__":
     with open(args.config) as f:
         cfg = yaml.safe_load(f)
 
+    if args.use_supcon_augmentations is not None:
+        cfg.setdefault("data", {})["train_dataset"] = (
+            "supcon_two_view" if args.use_supcon_augmentations else "standard"
+        )
+    if args.train_dataset is not None:
+        cfg.setdefault("data", {})["train_dataset"] = args.train_dataset
     if args.seed is not None:
         cfg.setdefault("training", {})["seed"] = args.seed
         if cfg.get("output", {}).get("checkpoint_path"):

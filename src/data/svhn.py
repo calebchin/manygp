@@ -34,7 +34,7 @@ def get_svhn_loader(
         data_root:        Directory to download / read SVHN from.
         batch_size:       Mini-batch size.
         num_workers:      DataLoader worker processes.
-        id_normalization: "cifar10" or "cifar100" — which normalization to apply.
+        id_normalization: "cifar10" or "cifar100"; which normalization to apply.
         split:            "test" (default) or "train" or "extra".
 
     Returns:

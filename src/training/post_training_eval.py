@@ -183,3 +183,8 @@ def run_full_ood_eval(
         })
 
     return results
+
+
+def run_ood_eval(*args, **kwargs) -> dict:
+    """Backward-compatible alias for older experiment scripts."""
+    return run_full_ood_eval(*args, **kwargs)
