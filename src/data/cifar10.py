@@ -240,6 +240,7 @@ def get_cifar10_supcon_loaders(
         val_loader,
         test_loader,
         train_contrastive_dataset,
+        train_memory_dataset,
         val_dataset,
         test_eval_dataset,
     )

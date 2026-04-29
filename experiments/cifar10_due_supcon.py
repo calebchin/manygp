@@ -14,7 +14,7 @@ from gpytorch.mlls import VariationalELBO
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from src.data.cifar10 import get_cifar10_loaders
+from src.data.cifar10 import get_cifar10_supcon_loaders
 from src.models.due.wide_resnet import WideResNet
 from src.models.dkl import GP, DKLModel, initial_values
 from src.training.evaluate import evaluate_classifier
@@ -60,34 +60,47 @@ def train_dkl(
         model.train()
         objective.train()
 
+        total_loss_sum = 0.0
+        supcon_loss_sum = 0.0
         elbo_loss_sum = 0.0
 
         for x_batch, y_batch in tqdm(train_loader, desc="Minibatch", leave=False):
-            x_batch, y_batch = x_batch.to(device), y_batch.to(device)
+            y_batch = y_batch.to(device, non_blocking=True)
+            batch_size, num_views, channels, height, width = x_batch.shape
+            x_batch = x_batch.to(device, non_blocking=True).view(batch_size * num_views, channels, height, width)
+            ce_labels = y_batch.repeat_interleave(num_views)
 
             optimizer.zero_grad()
-
             output, features = model(x_batch, return_features=True)
+            features = features.view(batch_size, num_views, -1)
 
-            elbo_loss = -mll(output, y_batch)
+            supcon_loss = supcon_loss_fn(features, y_batch)
+            elbo_loss = -mll(output, ce_labels)
+            total_loss = supcon_weight * supcon_loss + elbo_loss
 
-            elbo_loss.backward()
+            total_loss.backward()
             optimizer.step()
 
+            total_loss_sum += total_loss.item()
+            supcon_loss_sum += supcon_loss.item()
             elbo_loss_sum += elbo_loss.item()
 
         scheduler.step()
 
+        avg_total_loss = total_loss_sum / len(train_loader)
+        avg_supcon_loss = supcon_loss_sum / len(train_loader)
         avg_elbo_loss = elbo_loss_sum / len(train_loader)
-        epoch_losses.append(avg_elbo_loss)
+        epoch_losses.append(avg_total_loss)
 
-        print(f"Epoch {epoch+1}/{num_epochs} | elbo: {avg_elbo_loss:.4f}")
+        print(f"Epoch {epoch+1}/{num_epochs} | Loss: {avg_total_loss:.4f} | supcon: {avg_supcon_loss:.4f} | elbo: {avg_elbo_loss:.4f}")
 
 
         metric = evaluate_dkl(model, objective, test_loader, device, run)
 
         if run is not None:
             run.log({
+                "train/total_loss": avg_total_loss,
+                "train/supcon_loss": avg_supcon_loss,
                 "train/elbo_loss": avg_elbo_loss,
                 "train/epoch": epoch + 1,
                 "train/lr": scheduler.get_last_lr()[0],
@@ -188,11 +201,10 @@ def main(cfg: dict, config_path: str) -> None:
         run.log_artifact(config_artifact)
 
     data_cfg = cfg["data"]
-
-    train_loader, val_loader, test_loader, dataset_train, _, _ = get_cifar10_loaders(
-        data_root=cfg["data"]["root"],
-        batch_size=cfg["data"]["batch_size"],
-        num_workers=cfg["data"]["num_workers"],
+    train_loader, _, val_loader, test_loader, _, memory_dataset, _, _ = get_cifar10_supcon_loaders(
+        data_root=data_cfg["root"],
+        batch_size=data_cfg["batch_size"],
+        num_workers=data_cfg["num_workers"],
         smoke_test=cfg["experiment"]["smoke_test"],
     )
 
@@ -211,7 +223,7 @@ def main(cfg: dict, config_path: str) -> None:
 
 
     initial_inducing_points, initial_lengthscale = initial_values(
-        dataset_train, cnn, model_cfg["num_inducing_pts"]
+        memory_dataset, cnn, model_cfg["num_inducing_pts"]
     )
 
     print(f"Inducing points shape: {initial_inducing_points.shape}")
@@ -239,7 +251,6 @@ def main(cfg: dict, config_path: str) -> None:
     Path(checkpoint_path).parent.mkdir(parents=True, exist_ok=True)
 
     runtime_cfg = copy.deepcopy(cfg)
-
     train_dkl(
         model=dkl,
         objective=objective,

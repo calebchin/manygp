@@ -70,7 +70,7 @@ def run_full_ood_eval(
     ood_cfg = cfg.get("ood", {})
 
     results: dict = {"ood": {}, "cifarc": {}}
-
+    is_due = model_type == "due"
     # -------------------------------------------------------------------------
     # 1. OOD detection: SVHN
     # -------------------------------------------------------------------------
@@ -82,7 +82,7 @@ def run_full_ood_eval(
         id_normalization="cifar10",
     )
     ood_logits, ood_probs, _, _ = collect_logits_and_probs(wrapper, svhn_loader, device, num_mc_samples)
-    svhn_metrics = evaluate_ood_split(id_logits, id_probs, ood_logits, ood_probs)
+    svhn_metrics = evaluate_ood_split(id_logits, id_probs, ood_logits, ood_probs, is_due)
     results["ood"]["svhn"] = svhn_metrics
     print(f"  DS  AUROC: {svhn_metrics['dempster_shafer']['auroc']:.4f}  "
           f"AUPR: {svhn_metrics['dempster_shafer']['aupr']:.4f}")
@@ -107,7 +107,7 @@ def run_full_ood_eval(
         num_workers=num_workers,
     )
     ood_logits, ood_probs, _, _ = collect_logits_and_probs(wrapper, cifar100_loader, device, num_mc_samples)
-    cifar100_metrics = evaluate_ood_split(id_logits, id_probs, ood_logits, ood_probs)
+    cifar100_metrics = evaluate_ood_split(id_logits, id_probs, ood_logits, ood_probs, is_due)
     results["ood"]["cifar100"] = cifar100_metrics
     print(f"  DS  AUROC: {cifar100_metrics['dempster_shafer']['auroc']:.4f}  "
           f"AUPR: {cifar100_metrics['dempster_shafer']['aupr']:.4f}")

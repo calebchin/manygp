@@ -14,13 +14,13 @@ from gpytorch.mlls import VariationalELBO
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from src.data.cifar10 import get_cifar10_loaders
+from src.data.cifar10 import get_cifar10_supcon_loaders
 from src.models.due.wide_resnet import WideResNet
 from src.models.dkl import GP, DKLModel, initial_values
 from src.training.evaluate import evaluate_classifier
 from src.models.resnet import CifarResNetEncoder
 from src.models.sngp import WideResNet28SNGPBackbone
-from src.training.contrastive import SupConLoss
+from src.training.contrastive import MultiSimilarityLoss
 from src.training.evaluate import _classification_ece
 
 
@@ -29,8 +29,8 @@ def train_dkl(
     objective,
     train_loader,
     test_loader,
-    supcon_loss_fn,
-    supcon_weight,
+    ms_loss_fn,
+    ms_weight,
     num_epochs: int,
     lr: float,
     milestones,
@@ -60,34 +60,46 @@ def train_dkl(
         model.train()
         objective.train()
 
+        total_loss_sum = 0.0
+        ms_loss_sum = 0.0
         elbo_loss_sum = 0.0
 
         for x_batch, y_batch in tqdm(train_loader, desc="Minibatch", leave=False):
-            x_batch, y_batch = x_batch.to(device), y_batch.to(device)
+            y_batch = y_batch.to(device, non_blocking=True)
+            batch_size, num_views, channels, height, width = x_batch.shape
+            x_batch = x_batch.to(device, non_blocking=True).view(batch_size * num_views, channels, height, width)
+            ce_labels = y_batch.repeat_interleave(num_views)
 
             optimizer.zero_grad()
-
             output, features = model(x_batch, return_features=True)
 
-            elbo_loss = -mll(output, y_batch)
+            ms_loss = ms_loss_fn(features, ce_labels)
+            elbo_loss = -mll(output, ce_labels)
+            total_loss = ms_weight * ms_loss + elbo_loss
 
-            elbo_loss.backward()
+            total_loss.backward()
             optimizer.step()
 
+            total_loss_sum += total_loss.item()
+            ms_loss_sum += ms_loss.item()
             elbo_loss_sum += elbo_loss.item()
 
         scheduler.step()
 
+        avg_total_loss = total_loss_sum / len(train_loader)
+        avg_ms_loss = ms_loss_sum / len(train_loader)
         avg_elbo_loss = elbo_loss_sum / len(train_loader)
-        epoch_losses.append(avg_elbo_loss)
+        epoch_losses.append(avg_total_loss)
 
-        print(f"Epoch {epoch+1}/{num_epochs} | elbo: {avg_elbo_loss:.4f}")
+        print(f"Epoch {epoch+1}/{num_epochs} | Loss: {avg_total_loss:.4f} | ms: {avg_ms_loss:.4f} | elbo: {avg_elbo_loss:.4f}")
 
 
         metric = evaluate_dkl(model, objective, test_loader, device, run)
 
         if run is not None:
             run.log({
+                "train/total_loss": avg_total_loss,
+                "train/ms_loss": avg_ms_loss,
                 "train/elbo_loss": avg_elbo_loss,
                 "train/epoch": epoch + 1,
                 "train/lr": scheduler.get_last_lr()[0],
@@ -188,11 +200,10 @@ def main(cfg: dict, config_path: str) -> None:
         run.log_artifact(config_artifact)
 
     data_cfg = cfg["data"]
-
-    train_loader, val_loader, test_loader, dataset_train, _, _ = get_cifar10_loaders(
-        data_root=cfg["data"]["root"],
-        batch_size=cfg["data"]["batch_size"],
-        num_workers=cfg["data"]["num_workers"],
+    train_loader, _, val_loader, test_loader, _, memory_dataset, _, _ = get_cifar10_supcon_loaders(
+        data_root=data_cfg["root"],
+        batch_size=data_cfg["batch_size"],
+        num_workers=data_cfg["num_workers"],
         smoke_test=cfg["experiment"]["smoke_test"],
     )
 
@@ -211,7 +222,7 @@ def main(cfg: dict, config_path: str) -> None:
 
 
     initial_inducing_points, initial_lengthscale = initial_values(
-        dataset_train, cnn, model_cfg["num_inducing_pts"]
+        memory_dataset, cnn, model_cfg["num_inducing_pts"]
     )
 
     print(f"Inducing points shape: {initial_inducing_points.shape}")
@@ -233,7 +244,12 @@ def main(cfg: dict, config_path: str) -> None:
     dkl = DKLModel(cnn, gp, objective).to(device)
 
     train_cfg = cfg["training"]
-    supcon_loss_fn = SupConLoss(temperature=train_cfg["supcon_temperature"])
+    ms_loss_fn = MultiSimilarityLoss(
+        alpha=train_cfg.get("ms_alpha", 2.0),
+        beta=train_cfg.get("ms_beta",  50.0),
+        base=train_cfg.get("ms_base",  0.5),
+        eps=train_cfg.get("ms_eps",    0.1),
+    )
     num_epochs = 1 if cfg["experiment"]["smoke_test"] else train_cfg["num_epochs"]
     checkpoint_path = cfg["outputs"]["checkpoint_path"]
     Path(checkpoint_path).parent.mkdir(parents=True, exist_ok=True)
@@ -245,8 +261,8 @@ def main(cfg: dict, config_path: str) -> None:
         objective=objective,
         train_loader=train_loader,
         test_loader=val_loader,
-        supcon_loss_fn=supcon_loss_fn,
-        supcon_weight=train_cfg["supcon_weight"],
+        ms_loss_fn=ms_loss_fn,
+        ms_weight=train_cfg["ms_weight"],
         num_epochs=num_epochs,
         lr=train_cfg["initial_lr"],
         milestones=train_cfg["milestones"],

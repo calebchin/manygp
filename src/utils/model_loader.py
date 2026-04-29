@@ -21,6 +21,7 @@ class ModelWrapper:
       - CifarResNetClassifier         (cifar10_classifier)
       - FrozenBackboneSNGPClassifier  (cifar10_frozen_sngp)
       - CifarResNetSupConSNGPClassifier (cifar10_supcon_sngp)
+      - DKL                             (due)
     """
 
     def __init__(
@@ -29,17 +30,24 @@ class ModelWrapper:
         has_cov: bool,
         num_mc_samples: int = 10,
         model_type: str = "",
+        likelihood: nn.Module | None = None,
     ):
         self.model = model
         self.has_cov = has_cov
         self.num_mc_samples = num_mc_samples
         self.model_type = model_type
+        self.likelihood = likelihood
+
+        if self.likelihood is not None:
+            self.likelihood.num_samples = num_mc_samples
 
     @torch.no_grad()
     def predict_logits(
         self, x: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         """Returns (logits, variances). variances is None for plain classifiers."""
+        if self.model_type == "due":
+            raise RuntimeError("Use predict() for DUE")
         if self.has_cov:
             logits, variances = self.model(x, return_cov=True)
             return logits, variances
@@ -50,12 +58,52 @@ class ModelWrapper:
     @torch.no_grad()
     def predict_probs(self, x: torch.Tensor) -> torch.Tensor:
         """Returns (N, K) softmax probabilities (Laplace for SNGP variants)."""
+        if self.model_type == "due":
+            output = self.model(x)
+            output = output.to_data_independent_dist()
+
+            dist = self.model.likelihood(output)
+            probs = dist.probs.mean(0)
+
+            logits = torch.log(probs + 1e-8)
+            uncertainty = -(probs * probs.log()).sum(1)
+            return uncertainty, probs
+
         from src.models.sngp import laplace_predictive_probs
 
         logits, variances = self.predict_logits(x)
         if self.has_cov and variances is not None:
             return laplace_predictive_probs(logits, variances, num_mc_samples=self.num_mc_samples)
         return F.softmax(logits, dim=-1)
+
+
+def _build_due(model_cfg: dict, device: torch.device):
+    from gpytorch.likelihoods import SoftmaxLikelihood
+    from src.models.dkl import GP, DKLModel
+    from src.models.resnet import CifarResNetEncoder
+
+    cnn = CifarResNetEncoder(
+        widen_factor=model_cfg["widen_factor"],
+        embedding_dim=model_cfg["embedding_dim"],
+    ).to(device)
+
+    gp = GP(
+        num_outputs=model_cfg["num_classes"],
+        initial_lengthscale=0.0,
+        initial_inducing_points=torch.zeros(
+            model_cfg["num_inducing"], model_cfg["feature_dim"]
+        ).to(device),
+        kernel=model_cfg.get("kernel", "RBF"),
+    ).to(device)
+
+    model = DKLModel(cnn, gp).to(device)
+
+    likelihood = SoftmaxLikelihood(
+        num_classes=model_cfg["num_classes"],
+        mixing_weights=False,
+    ).to(device)
+
+    return model, likelihood, False
 
 
 def _build_sngp(model_cfg: dict, device: torch.device) -> tuple[nn.Module, bool]:
@@ -179,6 +227,9 @@ def load_model_from_checkpoint(
     elif "classifier" in exp_name:
         model, has_cov = _build_classifier(model_cfg, device)
         model_type = "classifier"
+    elif "due" in exp_name:
+        model, likelihood, has_cov = build_due(model_cfg, device)
+        model_type = "due"
     else:
         raise ValueError(
             f"Cannot determine model type from experiment name: '{exp_name}'. "
@@ -186,8 +237,15 @@ def load_model_from_checkpoint(
         )
 
     state_dict = checkpoint.get("model_state_dict", checkpoint)
-    model.load_state_dict(state_dict)
+    if model_type == "due":
+        model.load_state_dict(state_dict["model"])
+        likelihood.load_state_dict(state_dict["likelihood"])
+        model.likelihood = likelihood
+    else:
+        model.load_state_dict(state_dict)
+
     model.eval()
+    likelihood.eval()
 
     print(f"Loaded {model_type} model from '{checkpoint_path}' (exp: {exp_name})")
     return ModelWrapper(
@@ -195,4 +253,5 @@ def load_model_from_checkpoint(
         has_cov=has_cov,
         num_mc_samples=num_mc_samples,
         model_type=model_type,
+        likelihood=likelihood if model_type == "due" else None,
     )

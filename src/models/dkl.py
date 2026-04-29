@@ -134,13 +134,16 @@ class DKLModel(gpytorch.Module):
         self.likelihood = likelihood
         self.per_feature = per_feature
 
-    def forward(self, x):
+    def forward(self, x, return_features=False):
         features = self.feature_extractor(x)
+        output = self.gp_layer(features)
         if self.per_feature:
             features = features.transpose(-1, -2).unsqueeze(-1)
-        res = self.gp_layer(features)
-        return res
-    
+        if return_features:
+            return output, features
+        return output
+
+
     def predict(self, loader, cnn=None, device=None):
         """
         Run inference over a DataLoader for DKL model.
@@ -161,15 +164,15 @@ class DKLModel(gpytorch.Module):
         with torch.no_grad():
             for x_batch, y_batch in loader:
                 x_batch, y_batch = x_batch.to(device), y_batch.to(device)
-                
+
                 # Forward pass through the entire model (feature extraction + GP)
                 output = self(x_batch)
-                
+
                 # Get log marginal from the GP layer's likelihood
                 # Need access to the GP's likelihood/objective from outside
                 base_ll = self.likelihood.log_marginal(y_batch, output)
                 all_lls.append(base_ll.cpu())
-                
+
                 # Get predictions from mean of distribution
                 all_preds.append(self.likelihood(output).probs.mean(0).argmax(dim=-1).cpu())
 

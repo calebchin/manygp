@@ -124,13 +124,16 @@ def collect_logits_and_probs(
     for images, labels in loader:
         images = images.to(device, non_blocking=True)
 
-        logits, variances = model_wrapper.predict_logits(images)
-
-        if model_wrapper.has_cov and variances is not None:
-            from src.models.sngp import laplace_predictive_probs
-            probs = laplace_predictive_probs(logits, variances, num_mc_samples=num_mc_samples)
+        if model_wrapper.model_type == "due":
+            logits, probs = model_wrapper.predict_probs(images)
         else:
-            probs = F.softmax(logits, dim=-1)
+            logits, variances = model_wrapper.predict_logits(images)
+
+            if model_wrapper.has_cov and variances is not None:
+                from src.models.sngp import laplace_predictive_probs
+                probs = laplace_predictive_probs(logits, variances, num_mc_samples=num_mc_samples)
+            else:
+                probs = F.softmax(logits, dim=-1)
 
         all_logits.append(logits.cpu())
         all_probs.append(probs.cpu())
@@ -157,6 +160,7 @@ def evaluate_ood_split(
     id_probs: torch.Tensor,
     ood_logits: torch.Tensor,
     ood_probs: torch.Tensor,
+    due: Bool = False,
 ) -> dict[str, dict[str, float]]:
     """
     Evaluates OOD detection for one OOD dataset using both scoring methods.
@@ -173,8 +177,12 @@ def evaluate_ood_split(
           "max_prob":        {"auroc": float, "aupr": float},
         }
     """
-    ds_id = dempster_shafer_uncertainty(id_logits)
-    ds_ood = dempster_shafer_uncertainty(ood_logits)
+    if due:
+      ds_id = id_logits
+      ds_ood = ood_logits
+    else:
+        ds_id = dempster_shafer_uncertainty(id_logits)
+        ds_ood = dempster_shafer_uncertainty(ood_logits)
     mp_id = max_prob_uncertainty(id_probs)
     mp_ood = max_prob_uncertainty(ood_probs)
 
